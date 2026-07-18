@@ -22,7 +22,7 @@
    "enableDivergenceSolver": true,
    "cudaOrchestrator": 2
   },
-  "stopAt": 1.0,
+  "stopAt": 1.2,
   "enableVTKExport": true,
   "dataExportFPS": 10,
   "particleAttributes": "velocity"
@@ -41,7 +41,7 @@
  "RigidBodies": [
   {
    "id": 0,
-   "geometryFile": "../models/UnitBox.obj",
+   "geometryFile": "../models/UnitCylinder.obj",
    "translation": [
     0,
     0.8,
@@ -63,9 +63,9 @@
    "mapInvert": true,
    "mapThickness": 0.0,
    "mapResolution": [
+    30,
     25,
-    25,
-    25
+    30
    ]
   },
   {
@@ -73,7 +73,7 @@
    "geometryFile": "../models/UnitBox.obj",
    "translation": [
     0,
-    0.2,
+    0.3,
     0
    ],
    "rotationAxis": [
@@ -83,9 +83,9 @@
    ],
    "rotationAngle": 0,
    "scale": [
-    1.2,
-    0.24,
-    0.1
+    1.0,
+    0.5,
+    0.08
    ],
    "color": [
     0.8,
@@ -100,8 +100,8 @@
    "mapThickness": 0.0,
    "mapResolution": [
     30,
-    12,
-    10
+    15,
+    8
    ]
   },
   {
@@ -109,7 +109,7 @@
    "geometryFile": "../models/UnitBox.obj",
    "translation": [
     0,
-    0.2,
+    0.3,
     0
    ],
    "rotationAxis": [
@@ -119,9 +119,9 @@
    ],
    "rotationAngle": 0,
    "scale": [
-    0.1,
-    0.24,
-    1.2
+    0.08,
+    0.5,
+    1.0
    ],
    "color": [
     0.8,
@@ -135,8 +135,8 @@
    "mapInvert": false,
    "mapThickness": 0.0,
    "mapResolution": [
-    10,
-    12,
+    8,
+    15,
     30
    ]
   }
@@ -147,7 +147,7 @@
    "bodyID2": 0,
    "position": [
     0,
-    0.2,
+    0.3,
     0
    ],
    "axis": [
@@ -162,7 +162,7 @@
    "bodyID2": 0,
    "position": [
     0,
-    0.2,
+    0.3,
     0
    ],
    "axis": [
@@ -188,13 +188,13 @@
    ],
    "translation": [
     0,
-    0.62,
+    0.85,
     0
    ],
    "scale": [
-    1.4,
+    1.1,
     0.5,
-    1.4
+    1.1
    ]
   }
  ]
