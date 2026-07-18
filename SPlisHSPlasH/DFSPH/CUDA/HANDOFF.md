@@ -283,6 +283,22 @@ Key implementation facts:
 
 Validation: bit-identical to Direct stream over the 100-step parity run.
 
+### Graph topology: chain → DAG (2026-07-18)
+
+Set `DFSPH_CUDA_GRAPH_DOT=/path/graph.dot` to dump the recorded step graph
+(Graphviz, verbose flags) on build. Initially the graph was a pure serial
+chain (~35 nodes) because every phase used one shared STF token. It is now a
+real DAG with 4 concurrent roots:
+- the neighborhood chain (cell keys → CUB radix sort → cell ranges),
+- `kComputeBoundary` (volume-map evaluation needs only positions, so it runs
+  on its own token concurrently with the whole neighborhood build; joins at
+  `kComputeDensity`),
+- the two loop-counter memsets (own token each via `recordSolverLoop`,
+  joining at their conditional node).
+Bit-identical; at 85k the DAG graph now beats Direct stream (2.11 vs 2.15 ms).
+Remaining sequential structure is inherent to DFSPH (each phase consumes the
+previous one's output).
+
 Performance (avg `DFSPH_CUDA_step` ms, RTX 3080 Ti, fixed dt):
 
 | Config | Direct(0) | StfStream(1) | WholeGraph(2) | Conditional(3) |

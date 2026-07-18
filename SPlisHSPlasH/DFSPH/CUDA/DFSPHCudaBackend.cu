@@ -365,7 +365,10 @@ void DFSPHCudaBackendImpl::recordSolverLoop(stf::stackable_ctx &sctx, Tok &tok,
 	real *dAvg = m_dErrOut + slot;
 
 	auto lCond = sctx.logical_data(stf::shape_of<stf::scalar_view<int>>()).set_symbol("loop_cond");
-	sctx.task(tok.rw())->*[=](cudaStream_t s) {
+	// Counter reset on its own token: independent of the preceding solver
+	// phases, so it can overlap them; the loop body joins both tokens.
+	auto tokIter = sctx.token();
+	sctx.task(tokIter.rw())->*[=](cudaStream_t s) {
 		cudaMemsetAsync(dIter, 0, sizeof(unsigned int), s);
 	};
 	{
@@ -375,7 +378,7 @@ void DFSPHCudaBackendImpl::recordSolverLoop(stf::stackable_ctx &sctx, Tok &tok,
 		// device-side condition update. All solver state lives in raw device
 		// buffers; the token serializes against the surrounding phases and the
 		// loop-continue flag orders update_cond after the body.
-		sctx.task(tok.rw(), lCond.write())->*[=](cudaStream_t s, auto cond) {
+		sctx.task(tok.rw(), tokIter.rw(), lCond.write())->*[=](cudaStream_t s, auto cond) {
 			launchComputePressureAccel(m_s, m_map0, m_kernel, pressure, m_eps, 0, m_reaction, s);
 			launchSolveIterate(m_s, m_map0, m_kernel, pressure, hFactor, isPressure, m_eps, m_errScratch, s);
 			size_t bytes = m_cubTempBytes;
@@ -452,14 +455,22 @@ void DFSPHCudaBackendImpl::runTimestepGraph(const StepDesc &sd, StepStats &stats
 		m_stepGraph = {};
 		sctx.push();
 		auto tok = sctx.token();
+		auto tokBoundary = sctx.token();
 
-		// 1-4. Neighborhood, boundary contribution, density, DFSPH factor.
-		// neighborhood() re-points m_s.cellKey/sortedId on the host during
-		// recording, so later lambdas (which read m_s through `this` when they
-		// are recorded) see the sorted buffers.
+		// 1. Neighborhood build. neighborhood() re-points m_s.cellKey/sortedId on
+		// the host during recording, so later lambdas (which read m_s through
+		// `this` when they are recorded) see the sorted buffers.
 		sctx.task(tok.rw())->*[=](cudaStream_t s) {
 			neighborhood(s);
+		};
+		// 2. Boundary contribution (volume-map evaluation). Depends only on the
+		// particle positions, not on the sorted grid — a separate token lets STF
+		// run it concurrently with the whole neighborhood build.
+		sctx.task(tokBoundary.rw())->*[=](cudaStream_t s) {
 			launchComputeBoundary(m_s, m_map0, dt0, s);
+		};
+		// 3-4. Density and DFSPH factor join both branches.
+		sctx.task(tok.rw(), tokBoundary.rw())->*[=](cudaStream_t s) {
 			launchComputeDensity(m_s, m_map0, m_kernel, s);
 			launchComputeFactor(m_s, m_map0, m_kernel, m_eps, s);
 		};
@@ -506,6 +517,14 @@ void DFSPHCudaBackendImpl::runTimestepGraph(const StepDesc &sd, StepStats &stats
 		m_graphDt = dt0;
 		m_graphGrav[0] = gravity.x; m_graphGrav[1] = gravity.y; m_graphGrav[2] = gravity.z;
 		stats.graphBuilds++;
+
+		// Debug: dump the recorded step graph as Graphviz when requested.
+		if (const char *dot = std::getenv("DFSPH_CUDA_GRAPH_DOT"))
+		{
+			cudaCheck(cudaGraphDebugDotPrint(m_stepGraph.graph(), dot, cudaGraphDebugDotFlagsVerbose),
+					  "graph dot dump");
+			std::fprintf(stderr, "[dfsph-cuda] step graph dumped to %s\n", dot);
+		}
 	}
 
 	m_stepGraph.launch();
