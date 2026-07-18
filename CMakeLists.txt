@@ -13,6 +13,28 @@ if (NOT WIN32)
 	message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
 endif()
 
+################################################################################
+# Optional CUDA DFSPH backend (CCCL + CUDASTF). OFF by default so the stock
+# CPU-only build and every existing solver are completely unaffected.
+################################################################################
+option(USE_CUDA_DFSPH "Build the optional device-resident DFSPH CUDA backend (CCCL + CUDASTF)" OFF)
+if (USE_CUDA_DFSPH)
+	# Local CCCL checkout that carries the deferred-args / CUDASTF features.
+	set(CCCL_DIR "$ENV{HOME}/git/caugonnet_cccl" CACHE PATH "Path to the local CCCL checkout")
+	set(CUDA_DFSPH_ARCHITECTURES "86" CACHE STRING "CUDA architectures for the DFSPH backend")
+
+	enable_language(CUDA)
+	find_package(CUDAToolkit REQUIRED)
+
+	if (NOT EXISTS "${CCCL_DIR}/libcudacxx/include")
+		message(FATAL_ERROR "USE_CUDA_DFSPH=ON but CCCL not found at CCCL_DIR='${CCCL_DIR}'.")
+	endif()
+
+	# Make Simulation.cpp / the facade compile the DFSPH_CUDA registration.
+	add_definitions(-DUSE_CUDA_DFSPH)
+	message(STATUS "CUDA DFSPH backend enabled (CCCL_DIR=${CCCL_DIR}, arch=${CUDA_DFSPH_ARCHITECTURES})")
+endif()
+
 set(ExternalInstallDir "${CMAKE_BINARY_DIR}/extern/install" CACHE INTERNAL "")
 set(EXT_CMAKE_BUILD_TYPE ${CMAKE_BUILD_TYPE} CACHE INTERNAL "")
 if (NOT ${CMAKE_BUILD_TYPE} STREQUAL "Debug")

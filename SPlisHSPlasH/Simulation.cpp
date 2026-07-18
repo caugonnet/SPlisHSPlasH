@@ -10,6 +10,9 @@
 #include "SPlisHSPlasH/DFSPH/TimeStepDFSPH.h"
 #include "SPlisHSPlasH/PF/TimeStepPF.h"
 #include "SPlisHSPlasH/ICSPH/TimeStepICSPH.h"
+#ifdef USE_CUDA_DFSPH
+#include "SPlisHSPlasH/DFSPH/CUDA/TimeStepDFSPHCUDA.h"
+#endif
 #include "BoundaryModel_Akinci2012.h"
 #include "BoundaryModel_Bender2019.h"
 #include "BoundaryModel_Koschier2017.h"
@@ -56,6 +59,7 @@ int Simulation::ENUM_SIMULATION_IISPH = -1;
 int Simulation::ENUM_SIMULATION_DFSPH = -1;
 int Simulation::ENUM_SIMULATION_PF = -1;
 int Simulation::ENUM_SIMULATION_ICSPH = -1;
+int Simulation::ENUM_SIMULATION_DFSPH_CUDA = -1;
 int Simulation::BOUNDARY_HANDLING_METHOD = -1;
 int Simulation::ENUM_AKINCI2012 = -1;
 int Simulation::ENUM_KOSCHIER2017 = -1;
@@ -265,6 +269,9 @@ void Simulation::initParameters()
 	enumParam->addEnumValue(TimeStepDFSPH::METHOD_NAME, ENUM_SIMULATION_DFSPH);
 	enumParam->addEnumValue(TimeStepPF::METHOD_NAME, ENUM_SIMULATION_PF);
 	enumParam->addEnumValue(TimeStepICSPH::METHOD_NAME, ENUM_SIMULATION_ICSPH);
+#ifdef USE_CUDA_DFSPH
+	enumParam->addEnumValue(TimeStepDFSPHCUDA::METHOD_NAME, ENUM_SIMULATION_DFSPH_CUDA);
+#endif
 
 	BOUNDARY_HANDLING_METHOD = createEnumParameter("boundaryHandlingMethod", "Boundary handling method", &m_boundaryHandlingMethod);
 	setGroup(BOUNDARY_HANDLING_METHOD, "Simulation|Simulation");
@@ -595,6 +602,17 @@ void Simulation::setSimulationMethod(const int val)
 		m_timeStep->init();
 		setValue(Simulation::KERNEL_METHOD, Simulation::ENUM_KERNEL_CUBIC);
 		setValue(Simulation::GRAD_KERNEL_METHOD, Simulation::ENUM_GRADKERNEL_CUBIC);
+	}
+	else if (method == SimulationMethods::DFSPH_CUDA)
+	{
+#ifdef USE_CUDA_DFSPH
+		m_timeStep = new TimeStepDFSPHCUDA();
+#else
+		m_timeStep = new TimeStepDFSPH();
+#endif
+		m_timeStep->init();
+		setValue(Simulation::KERNEL_METHOD, Simulation::ENUM_KERNEL_PRECOMPUTED_CUBIC);
+		setValue(Simulation::GRAD_KERNEL_METHOD, Simulation::ENUM_GRADKERNEL_PRECOMPUTED_CUBIC);
 	}
 
 	if (m_simulationMethodChanged != nullptr)

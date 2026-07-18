@@ -49,6 +49,19 @@ set(DFSPH_SOURCE_FILES
 	DFSPH/SimulationDataDFSPH.cpp
 	DFSPH/TimeStepDFSPH.cpp
 	)	
+
+# Host-side facade for the optional CUDA DFSPH backend (compiled at the project
+# standard; CUDA/CCCL stay behind the opaque backend interface).
+if (USE_CUDA_DFSPH)
+	list(APPEND DFSPH_HEADER_FILES
+		DFSPH/CUDA/DFSPHCudaBackend.h
+		DFSPH/CUDA/FeatureProbes.h
+		DFSPH/CUDA/TimeStepDFSPHCUDA.h
+	)
+	list(APPEND DFSPH_SOURCE_FILES
+		DFSPH/CUDA/TimeStepDFSPHCUDA.cpp
+	)
+endif()
 	
 set(PF_HEADER_FILES
 	PF/SimulationDataPF.h
@@ -298,6 +311,13 @@ target_link_libraries(SPlisHSPlasH
 	${NEIGHBORHOOD_SEARCH_LIBRARIES}
 	${DISCREGRID_LIBRARIES}
 )
+
+# Optional device-resident DFSPH backend (CCCL + CUDASTF).
+if (USE_CUDA_DFSPH)
+	add_subdirectory(DFSPH/CUDA)
+	add_dependencies(SPlisHSPlasH SPlisHSPlasH_CUDA)
+	target_link_libraries(SPlisHSPlasH PUBLIC SPlisHSPlasH_CUDA)
+endif()
 
 source_group("Header Files\\WCSPH" FILES ${WCSPH_HEADER_FILES})
 source_group("Source Files\\WCSPH" FILES ${WCSPH_SOURCE_FILES})
