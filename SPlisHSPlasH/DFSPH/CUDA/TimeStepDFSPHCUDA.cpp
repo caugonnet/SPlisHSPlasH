@@ -50,6 +50,7 @@ TimeStepDFSPHCUDA::TimeStepDFSPHCUDA()
 	, m_hPos(nullptr)
 	, m_hVel(nullptr)
 	, m_hDensity(nullptr)
+	, m_hIds(nullptr)
 	, m_pinnedCapacity(0)
 {
 	m_backend = cuda_dfsph::createDFSPHCudaBackend();
@@ -65,8 +66,10 @@ TimeStepDFSPHCUDA::~TimeStepDFSPHCUDA(void)
 		m_backend->freeHostPinned(m_hPos);
 		m_backend->freeHostPinned(m_hVel);
 		m_backend->freeHostPinned(m_hDensity);
+		m_backend->freeHostPinned(reinterpret_cast<cuda_dfsph::cudsph_real*>(m_hIds));
 	}
 	m_hPos = m_hVel = m_hDensity = nullptr;
+	m_hIds = nullptr;
 	delete m_backend;
 	m_backend = nullptr;
 }
@@ -78,10 +81,13 @@ void TimeStepDFSPHCUDA::ensurePinned(unsigned int n)
 	m_backend->freeHostPinned(m_hPos);
 	m_backend->freeHostPinned(m_hVel);
 	m_backend->freeHostPinned(m_hDensity);
+	m_backend->freeHostPinned(reinterpret_cast<cuda_dfsph::cudsph_real*>(m_hIds));
 	m_hPos = m_backend->allocHostPinned(3 * static_cast<size_t>(n));
 	m_hVel = m_backend->allocHostPinned(3 * static_cast<size_t>(n));
 	m_hDensity = m_backend->allocHostPinned(n);
-	m_pinnedCapacity = (m_hPos && m_hVel && m_hDensity) ? n : 0;
+	// sizeof(cudsph_real) >= sizeof(unsigned int) in both precision builds.
+	m_hIds = reinterpret_cast<unsigned int*>(m_backend->allocHostPinned(n));
+	m_pinnedCapacity = (m_hPos && m_hVel && m_hDensity && m_hIds) ? n : 0;
 }
 
 void TimeStepDFSPHCUDA::initParameters()
@@ -293,6 +299,7 @@ void TimeStepDFSPHCUDA::scatterHostState()
 	mirror.positions = m_hPos;
 	mirror.velocities = m_hVel;
 	mirror.density = m_hDensity;
+	mirror.particleIds = m_hIds; // device arrays are spatially sorted
 	// The solver-internal fields are only needed for debugging or when a scene
 	// exports them explicitly; the renderer and default exporters use
 	// position/velocity/density. copyStateToHost skips null pointers.
@@ -325,20 +332,23 @@ void TimeStepDFSPHCUDA::scatterHostState()
 	#pragma omp parallel for schedule(static) num_threads(mirrorThreads)
 	for (int i = 0; i < static_cast<int>(n); ++i)
 	{
-		model->setPosition(i, Vector3r(static_cast<Real>(m_hPos[3 * i + 0]),
+		// Device arrays are spatially sorted; scatter back to original order so
+		// exporters, selection and comparisons keep stable particle identities.
+		const unsigned int p = m_hIds[i];
+		model->setPosition(p, Vector3r(static_cast<Real>(m_hPos[3 * i + 0]),
 									   static_cast<Real>(m_hPos[3 * i + 1]),
 									   static_cast<Real>(m_hPos[3 * i + 2])));
-		model->setVelocity(i, Vector3r(static_cast<Real>(m_hVel[3 * i + 0]),
+		model->setVelocity(p, Vector3r(static_cast<Real>(m_hVel[3 * i + 0]),
 									   static_cast<Real>(m_hVel[3 * i + 1]),
 									   static_cast<Real>(m_hVel[3 * i + 2])));
-		model->setDensity(i, static_cast<Real>(m_hDensity[i]));
+		model->setDensity(p, static_cast<Real>(m_hDensity[i]));
 		if (m_fullMirror)
 		{
-			m_simulationData.setFactor(0, i, static_cast<Real>(m_hFactor[i]));
-			m_simulationData.setDensityAdv(0, i, static_cast<Real>(m_hDensityAdv[i]));
-			m_simulationData.setPressureRho2(0, i, static_cast<Real>(m_hPressureRho2[i]));
-			m_simulationData.setPressureRho2_V(0, i, static_cast<Real>(m_hPressureRho2V[i]));
-			m_simulationData.setPressureAccel(0, i, Vector3r(static_cast<Real>(m_hPressureAccel[3 * i + 0]),
+			m_simulationData.setFactor(0, p, static_cast<Real>(m_hFactor[i]));
+			m_simulationData.setDensityAdv(0, p, static_cast<Real>(m_hDensityAdv[i]));
+			m_simulationData.setPressureRho2(0, p, static_cast<Real>(m_hPressureRho2[i]));
+			m_simulationData.setPressureRho2_V(0, p, static_cast<Real>(m_hPressureRho2V[i]));
+			m_simulationData.setPressureAccel(0, p, Vector3r(static_cast<Real>(m_hPressureAccel[3 * i + 0]),
 															 static_cast<Real>(m_hPressureAccel[3 * i + 1]),
 															 static_cast<Real>(m_hPressureAccel[3 * i + 2])));
 		}

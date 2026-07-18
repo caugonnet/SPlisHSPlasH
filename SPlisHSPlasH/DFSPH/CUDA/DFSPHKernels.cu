@@ -30,7 +30,8 @@ static inline int gridBlocks(unsigned int n) { return static_cast<int>((n + kBlo
 			unsigned int _s1 = (s).cellEnd[_cell];                                              \
 			for (unsigned int _k = _s0; _k < _s1; ++_k)                                         \
 			{                                                                                  \
-				unsigned int jvar = (s).sortedId[_k];                                           \
+				/* particle arrays are stored in sorted order: direct indexing */               \
+				unsigned int jvar = _k;                                                         \
 				body                                                                           \
 			}                                                                                  \
 		}                                                                                      \
@@ -100,6 +101,31 @@ void launchBuildCellRanges(const DeviceState &s, cudaStream_t stream)
 {
 	kResetCellRanges<<<gridBlocks(s.numCells), kBlock, 0, stream>>>(s);
 	kBuildCellRanges<<<gridBlocks(s.n), kBlock, 0, stream>>>(s);
+}
+
+// Reorder the persistent per-particle fields into spatial (cell key) order:
+// out[i] = in[perm[i]]. Derived per-step fields (density, factor, accel, ...)
+// are recomputed after the sort and need no permutation. The scratch results
+// are copied back to the primary buffers by the caller so all device pointers
+// stay stable across steps (required for the recorded whole-step graph).
+__global__ void kGatherParticles(DeviceState s, const unsigned int *perm, GatherScratch out)
+{
+	unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= s.n) return;
+	const unsigned int src = perm[i];
+	out.pos[i] = s.pos[src];
+	out.vel[i] = s.vel[src];
+	out.mass[i] = s.mass[src];
+	out.state[i] = s.state[src];
+	out.pressureRho2[i] = s.pressureRho2[src];
+	out.pressureRho2V[i] = s.pressureRho2V[src];
+	out.origId[i] = s.origId[src];
+}
+
+void launchGatherParticles(const DeviceState &s, const unsigned int *perm,
+						   const GatherScratch &out, cudaStream_t stream)
+{
+	kGatherParticles<<<gridBlocks(s.n), kBlock, 0, stream>>>(s, perm, out);
 }
 
 // ---------------------------------------------------------------------------

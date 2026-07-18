@@ -134,6 +134,7 @@ private:
 	// scratch
 	unsigned int *m_baseKey = nullptr;  // fixed allocation for unsorted keys
 	unsigned int *m_baseId = nullptr;   // fixed allocation for unsorted ids
+	GatherScratch m_gather{};           // scratch for the spatial particle reorder
 	unsigned int *m_keysAlt = nullptr;
 	unsigned int *m_valsAlt = nullptr;
 	real *m_errScratch = nullptr;
@@ -289,6 +290,22 @@ void DFSPHCudaBackendImpl::initialize(const SceneDesc &scene)
 	m_valsAlt = devAlloc<unsigned int>(cap);
 	m_errScratch = devAlloc<real>(cap);
 
+	// Spatial reorder: original-id map + gather scratch (results are copied
+	// back to the primary buffers to keep device pointers stable).
+	m_s.origId = devAlloc<unsigned int>(cap);
+	m_gather.pos = devAlloc<real3>(cap);
+	m_gather.vel = devAlloc<real3>(cap);
+	m_gather.mass = devAlloc<real>(cap);
+	m_gather.state = devAlloc<int>(cap);
+	m_gather.pressureRho2 = devAlloc<real>(cap);
+	m_gather.pressureRho2V = devAlloc<real>(cap);
+	m_gather.origId = devAlloc<unsigned int>(cap);
+	{
+		std::vector<unsigned int> iota(scene.numParticles);
+		for (unsigned int i = 0; i < scene.numParticles; ++i) iota[i] = i;
+		cudaCheck(cudaMemcpy(m_s.origId, iota.data(), scene.numParticles * sizeof(unsigned int), cudaMemcpyHostToDevice), "origId H2D");
+	}
+
 	// Upload initial particle state.
 	cudaCheck(cudaMemcpy(m_s.pos, scene.positions, 3 * scene.numParticles * sizeof(real), cudaMemcpyHostToDevice), "pos H2D");
 	cudaCheck(cudaMemcpy(m_s.vel, scene.velocities, 3 * scene.numParticles * sizeof(real), cudaMemcpyHostToDevice), "vel H2D");
@@ -353,6 +370,12 @@ void DFSPHCudaBackendImpl::uploadState(const cudsph_real *positions, const cudsp
 		cudaCheck(cudaMemcpy(m_s.state, particleState, m_s.n * sizeof(int), cudaMemcpyHostToDevice), "state H2D");
 	cudaCheck(cudaMemset(m_s.pressureRho2, 0, m_s.capacity * sizeof(real)), "clear p");
 	cudaCheck(cudaMemset(m_s.pressureRho2V, 0, m_s.capacity * sizeof(real)), "clear pv");
+	// Uploaded host state is in original order: reset the sort map to identity.
+	{
+		std::vector<unsigned int> iota(m_s.n);
+		for (unsigned int i = 0; i < m_s.n; ++i) iota[i] = i;
+		cudaCheck(cudaMemcpy(m_s.origId, iota.data(), m_s.n * sizeof(unsigned int), cudaMemcpyHostToDevice), "origId H2D");
+	}
 }
 
 void DFSPHCudaBackendImpl::neighborhood(cudaStream_t stream)
@@ -364,6 +387,19 @@ void DFSPHCudaBackendImpl::neighborhood(cudaStream_t stream)
 	m_s.sortedId = m_baseId;
 	launchComputeCellKeys(m_s, stream);
 	launchSortByCell(m_s, m_keysAlt, m_valsAlt, m_cubTemp, m_cubTempBytes, stream);
+	// Reorder the persistent particle fields into cell-key order (memory
+	// locality for every neighbor loop; neighbor traversal then indexes
+	// directly instead of through sortedId). Gather into scratch, then copy
+	// back so the primary pointers stay stable for the recorded graph.
+	launchGatherParticles(m_s, m_s.sortedId, m_gather, stream);
+	const size_t nb = m_s.n;
+	cudaMemcpyAsync(m_s.pos, m_gather.pos, nb * sizeof(real3), cudaMemcpyDeviceToDevice, stream);
+	cudaMemcpyAsync(m_s.vel, m_gather.vel, nb * sizeof(real3), cudaMemcpyDeviceToDevice, stream);
+	cudaMemcpyAsync(m_s.mass, m_gather.mass, nb * sizeof(real), cudaMemcpyDeviceToDevice, stream);
+	cudaMemcpyAsync(m_s.state, m_gather.state, nb * sizeof(int), cudaMemcpyDeviceToDevice, stream);
+	cudaMemcpyAsync(m_s.pressureRho2, m_gather.pressureRho2, nb * sizeof(real), cudaMemcpyDeviceToDevice, stream);
+	cudaMemcpyAsync(m_s.pressureRho2V, m_gather.pressureRho2V, nb * sizeof(real), cudaMemcpyDeviceToDevice, stream);
+	cudaMemcpyAsync(m_s.origId, m_gather.origId, nb * sizeof(unsigned int), cudaMemcpyDeviceToDevice, stream);
 	launchBuildCellRanges(m_s, stream);
 }
 
@@ -506,7 +542,6 @@ void DFSPHCudaBackendImpl::runTimestepGraph(const StepDesc &sd, StepStats &stats
 		m_stepGraph = {};
 		sctx.push();
 		auto tok = sctx.token();
-		auto tokBoundary = sctx.token();
 
 		// 0. Promote the previous step's dtUsed to this step's base dt.
 		sctx.task(tok.rw())->*[=](cudaStream_t s) {
@@ -518,14 +553,14 @@ void DFSPHCudaBackendImpl::runTimestepGraph(const StepDesc &sd, StepStats &stats
 		sctx.task(tok.rw())->*[=](cudaStream_t s) {
 			neighborhood(s);
 		};
-		// 2. Boundary contribution (volume-map evaluation). Depends only on the
-		// particle positions, not on the sorted grid — a separate token lets STF
-		// run it concurrently with the whole neighborhood build.
-		sctx.task(tokBoundary.rw())->*[=](cudaStream_t s) {
+		// 2. Boundary contribution. The spatial reorder inside neighborhood()
+		// rewrites the particle arrays, so this must be ordered after it (a
+		// parallel branch raced with the reorder and read torn positions).
+		sctx.task(tok.rw())->*[=](cudaStream_t s) {
 			launchComputeBoundary(m_s, dt0, s);
 		};
-		// 3-4. Density and DFSPH factor join both branches.
-		sctx.task(tok.rw(), tokBoundary.rw())->*[=](cudaStream_t s) {
+		// 3-4. Density and DFSPH factor.
+		sctx.task(tok.rw())->*[=](cudaStream_t s) {
 			launchComputeDensity(m_s, m_kernel, s);
 			launchComputeFactor(m_s, m_kernel, m_eps, s);
 		};
@@ -645,7 +680,10 @@ void DFSPHCudaBackendImpl::runTimestep(const StepDesc &sd, StepStats &stats, cud
 	if (m_enableDivergence)
 	{
 		launchDivergenceInit(m_s, m_kernel, dt0, stream);
-		const real eta = (static_cast<real>(1.0) / dt0) * m_maxErrorV * static_cast<real>(0.01) * m_s.density0;
+		// Same expression as the device loop-cond kernel (etaBase / dt) so the
+		// host-controlled and while-graph paths take bit-identical decisions.
+		const real etaVBase = m_maxErrorV * static_cast<real>(0.01) * m_s.density0;
+		const real eta = etaVBase / dt0;
 		if (deviceLoops)
 		{
 			real avg = 0;
@@ -822,6 +860,8 @@ void DFSPHCudaBackendImpl::copyStateToHost(const HostMirror &mirror)
 	d2h(mirror.pressureRho2, m_s.pressureRho2, n * sizeof(real));
 	d2h(mirror.pressureRho2V, m_s.pressureRho2V, n * sizeof(real));
 	d2h(mirror.pressureAccel, m_s.pressureAccel, 3 * n * sizeof(real));
+	if (mirror.particleIds)
+		cudaCheck(cudaMemcpyAsync(mirror.particleIds, m_s.origId, n * sizeof(unsigned int), cudaMemcpyDeviceToHost, nullptr), "ids D2H");
 	cudaCheck(cudaStreamSynchronize(nullptr), "state D2H sync");
 }
 
@@ -961,6 +1001,10 @@ void DFSPHCudaBackendImpl::destroy()
 	cudaFree(m_s.pressureRho2); cudaFree(m_s.pressureRho2V); cudaFree(m_s.state);
 	cudaFree(m_s.boundaryVolume); cudaFree(m_s.boundaryXj);
 	cudaFree(m_baseKey); cudaFree(m_baseId); cudaFree(m_s.cellStart); cudaFree(m_s.cellEnd);
+	cudaFree(m_s.origId);
+	cudaFree(m_gather.pos); cudaFree(m_gather.vel); cudaFree(m_gather.mass); cudaFree(m_gather.state);
+	cudaFree(m_gather.pressureRho2); cudaFree(m_gather.pressureRho2V); cudaFree(m_gather.origId);
+	m_gather = GatherScratch{};
 	cudaFree(m_keysAlt); cudaFree(m_valsAlt); cudaFree(m_errScratch);
 	cudaFree(m_cubTemp); cudaFree(m_dReduce); cudaFree(m_dIter); cudaFree(m_dErrOut); cudaFree(m_dDt);
 	if (m_hReduce) cudaFreeHost(m_hReduce);

@@ -27,6 +27,20 @@ void launchSortByCell(DeviceState &s, unsigned int *keysAlt, unsigned int *valsA
 size_t querySortTempBytes(unsigned int capacity);
 void launchBuildCellRanges(const DeviceState &s, cudaStream_t stream);
 
+// Spatial particle reordering (see kGatherParticles).
+struct GatherScratch
+{
+	real3 *pos;
+	real3 *vel;
+	real *mass;
+	int *state;
+	real *pressureRho2;
+	real *pressureRho2V;
+	unsigned int *origId;
+};
+void launchGatherParticles(const DeviceState &s, const unsigned int *perm,
+						   const GatherScratch &out, cudaStream_t stream);
+
 // ---- Boundary (Bender2019) ------------------------------------------------
 void launchComputeBoundary(const DeviceState &s, real dt, cudaStream_t stream);
 

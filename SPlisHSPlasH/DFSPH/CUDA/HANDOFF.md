@@ -363,6 +363,32 @@ record-once/relaunch-many is the right pattern.
    accumulators (`BodyReactionAccum`, atomic double force/torque) and
    `updateBoundaryMapTransform` are already in place.
 
+## Spatial particle reordering (2026-07-18)
+
+Persistent particle fields (pos, vel, mass, state, both warm-start pressures)
+are gathered into cell-key order every step right after the radix sort
+(`kGatherParticles` → scratch → memcpy back so pointers stay graph-stable);
+neighbor loops then index directly (`j = k`, no sortedId indirection). An
+`origId` map (permuted alongside) lets the host mirror scatter results back in
+original particle order, so exporters/selection/parity see stable identities.
+GL rendering consumes the sorted order directly (order-independent points).
+
+Impact: DoubleDamBreak 85k 2.16 → 1.81 ms/step (−16%); the 89k motor scene at
+developed flow (t→3, well-mixed particles) 13.3 → 5.7 ms/step (**2.3×**) —
+locality matters most exactly in the expensive regime. Validation: frame-1
+parity vs CPU unchanged (1.687e-6), all orchestrators bit-identical over 61
+steps (per-particle FP math is order-preserved; only cross-particle reduction
+order changes, which flips ±1 solver iterations at thresholds and yields a
+different — equally valid — fp32 trajectory realization).
+
+Two traps hit on the way (both fixed, keep in mind when touching the graph):
+- The reorder made the whole-step graph's boundary∥neighborhood DAG split a
+  data race (the reorder rewrites pos which kComputeBoundary reads). Boundary
+  is serialized after the neighborhood task again.
+- The device loop-cond kernel computed the divergence tolerance as
+  `etaBase / dt` while the host loops computed `(1/dt) * ...` — a 1-ulp
+  difference that can flip an iteration decision. Both now use `etaBase / dt`.
+
 ## Known limitations / gotchas
 - **CCCL/CUDASTF bug found (report upstream)**: `graph_ctx`'s
   `add_mem_alloc_node` builds `cudaMemAccessDesc` entries for ALL visible CUDA

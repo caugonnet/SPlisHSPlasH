@@ -136,6 +136,9 @@ namespace cuda_dfsph
 		cudsph_real *pressureRho2 = nullptr;   // numParticles
 		cudsph_real *pressureRho2V = nullptr;  // numParticles
 		cudsph_real *pressureAccel = nullptr;  // 3 * numParticles
+		// Original particle index per (device-sorted) entry: mirror arrays are in
+		// device (spatially sorted) order; hosts scatter through this map.
+		unsigned int *particleIds = nullptr;   // numParticles
 	};
 
 	// Diagnostics collected per step (iteration counts, timings, transfers).

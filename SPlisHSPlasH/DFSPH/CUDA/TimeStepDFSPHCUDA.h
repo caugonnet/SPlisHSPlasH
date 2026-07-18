@@ -39,6 +39,7 @@ namespace SPH
 		cuda_dfsph::cudsph_real *m_hPos;
 		cuda_dfsph::cudsph_real *m_hVel;
 		cuda_dfsph::cudsph_real *m_hDensity;
+		unsigned int *m_hIds;           // original particle index per mirrored entry
 		unsigned int m_pinnedCapacity;
 		std::vector<cuda_dfsph::cudsph_real> m_hMass;
 		std::vector<int> m_hState;

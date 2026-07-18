@@ -147,6 +147,11 @@ struct DeviceState
 	// moving bodies do not invalidate a recorded CUDA graph).
 	const DeviceBoundaryMap *maps = nullptr;
 	int numMaps = 0;
+
+	// Original particle index of each (spatially sorted) particle. Particle
+	// arrays are reordered by cell key every step for memory locality; the
+	// host mirror uses this map to scatter results back in original order.
+	unsigned int *origId = nullptr;     // capacity
 };
 
 __device__ __forceinline__ int3 cellCoord(const DeviceState &s, real3 x)
