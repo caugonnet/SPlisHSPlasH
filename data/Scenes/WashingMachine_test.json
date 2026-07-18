@@ -1,6 +1,6 @@
 {
  "Configuration": {
-  "particleRadius": 0.015,
+  "particleRadius": 0.012,
   "numberOfStepsPerRenderUpdate": 4,
   "simulationMethod": 7,
   "gravitation": [
@@ -22,7 +22,7 @@
    "enableDivergenceSolver": true,
    "cudaOrchestrator": 2
   },
-  "stopAt": 1.2,
+  "stopAt": 2.0,
   "enableVTKExport": true,
   "dataExportFPS": 10,
   "particleAttributes": "velocity"
@@ -44,12 +44,18 @@
    "geometryFile": "../models/UnitCylinder.obj",
    "translation": [
     0,
-    0.8,
+    0.85,
     0
    ],
+   "rotationAxis": [
+    1,
+    0,
+    0
+   ],
+   "rotationAngle": 1.5707963267948966,
    "scale": [
     1.6,
-    1.6,
+    0.9,
     1.6
    ],
    "color": [
@@ -73,7 +79,7 @@
    "geometryFile": "../models/UnitBox.obj",
    "translation": [
     0,
-    0.3,
+    0.85,
     0
    ],
    "rotationAxis": [
@@ -83,9 +89,9 @@
    ],
    "rotationAngle": 0,
    "scale": [
-    1.0,
-    0.5,
-    0.08
+    1.4,
+    0.1,
+    0.6
    ],
    "color": [
     0.8,
@@ -100,8 +106,8 @@
    "mapThickness": 0.0,
    "mapResolution": [
     30,
-    15,
-    8
+    8,
+    15
    ]
   },
   {
@@ -109,7 +115,7 @@
    "geometryFile": "../models/UnitBox.obj",
    "translation": [
     0,
-    0.3,
+    0.85,
     0
    ],
    "rotationAxis": [
@@ -119,9 +125,9 @@
    ],
    "rotationAngle": 0,
    "scale": [
-    0.08,
-    0.5,
-    1.0
+    0.1,
+    1.4,
+    0.6
    ],
    "color": [
     0.8,
@@ -136,8 +142,8 @@
    "mapThickness": 0.0,
    "mapResolution": [
     8,
-    15,
-    30
+    30,
+    15
    ]
   }
  ],
@@ -147,30 +153,30 @@
    "bodyID2": 0,
    "position": [
     0,
-    0.3,
+    0.85,
     0
    ],
    "axis": [
     0,
-    1,
-    0
+    0,
+    1
    ],
-   "target": -8
+   "target": -6
   },
   {
    "bodyID1": 2,
    "bodyID2": 0,
    "position": [
     0,
-    0.3,
+    0.85,
     0
    ],
    "axis": [
     0,
-    1,
-    0
+    0,
+    1
    ],
-   "target": -8
+   "target": -6
   }
  ],
  "FluidBlocks": [
@@ -187,14 +193,37 @@
     0.5
    ],
    "translation": [
-    0,
-    0.85,
+    -0.3,
+    0.47,
     0
    ],
    "scale": [
-    1.1,
+    0.4,
+    0.3,
+    0.7
+   ]
+  },
+  {
+   "denseMode": 0,
+   "start": [
+    -0.5,
+    -0.5,
+    -0.5
+   ],
+   "end": [
     0.5,
-    1.1
+    0.5,
+    0.5
+   ],
+   "translation": [
+    0.3,
+    0.47,
+    0
+   ],
+   "scale": [
+    0.4,
+    0.3,
+    0.7
    ]
   }
  ]
