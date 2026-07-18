@@ -119,60 +119,66 @@ __device__ __forceinline__ void rotateToWorld(const DeviceBoundaryMap &m, const 
 		out[k] = m.R[k * 3 + 0] * v[0] + m.R[k * 3 + 1] * v[1] + m.R[k * 3 + 2] * v[2];
 }
 
-__global__ void kComputeBoundary(DeviceState s, DeviceBoundaryMap m, real supportRadius, real particleRadius)
+__global__ void kComputeBoundary(DeviceState s, real supportRadius, real particleRadius)
 {
 	unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
 	if (i >= s.n) return;
 
-	s.boundaryVolume[i] = 0;
-	s.boundaryXj[i] = make_r3(0, 0, 0);
-	if (!m.valid) return;
-	if (s.state[i] != 0) return; // only Active particles
-
+	const bool active = (s.state[i] == 0);
 	const real3 xi = s.pos[i];
-	double localXi[3];
-	worldToLocal(m, xi, localXi);
 
-	BmShape sh;
-	bool chk = bmDetermine(m, 0, localXi, true, sh);
-	if (!chk) return;
-
-	double normalLocal[3];
-	double dist = bmEval(m, 0, sh, normalLocal);
-	if (dist == DBL_MAX) return;
-
-	if (dist > 0.0 && static_cast<real>(dist) < supportRadius)
+	for (int b = 0; b < s.numMaps; ++b)
 	{
-		double volume = bmEval(m, 1, sh, nullptr);
-		if (volume > 0.0 && volume != DBL_MAX)
+		const unsigned int slot = static_cast<unsigned int>(b) * s.capacity + i;
+		s.boundaryVolume[slot] = 0;
+		s.boundaryXj[slot] = make_r3(0, 0, 0);
+		const DeviceBoundaryMap &m = s.maps[b];
+		if (!m.valid || !active) continue; // only Active particles
+
+		double localXi[3];
+		worldToLocal(m, xi, localXi);
+
+		BmShape sh;
+		bool chk = bmDetermine(m, 0, localXi, true, sh);
+		if (!chk) continue;
+
+		double normalLocal[3];
+		double dist = bmEval(m, 0, sh, normalLocal);
+		if (dist == DBL_MAX) continue;
+
+		if (dist > 0.0 && static_cast<real>(dist) < supportRadius)
 		{
-			double nWorld[3];
-			rotateToWorld(m, normalLocal, nWorld);
-			double nl = sqrt(nWorld[0] * nWorld[0] + nWorld[1] * nWorld[1] + nWorld[2] * nWorld[2]);
-			if (nl > 1.0e-9)
+			double volume = bmEval(m, 1, sh, nullptr);
+			if (volume > 0.0 && volume != DBL_MAX)
 			{
-				nWorld[0] /= nl; nWorld[1] /= nl; nWorld[2] /= nl;
-				real d = static_cast<real>(dist) + static_cast<real>(0.5) * particleRadius;
-				real dmin = static_cast<real>(2.0) * particleRadius;
-				if (d < dmin) d = dmin;
-				s.boundaryVolume[i] = static_cast<real>(volume);
-				s.boundaryXj[i] = make_r3(xi.x - d * static_cast<real>(nWorld[0]),
-										  xi.y - d * static_cast<real>(nWorld[1]),
-										  xi.z - d * static_cast<real>(nWorld[2]));
+				double nWorld[3];
+				rotateToWorld(m, normalLocal, nWorld);
+				double nl = sqrt(nWorld[0] * nWorld[0] + nWorld[1] * nWorld[1] + nWorld[2] * nWorld[2]);
+				if (nl > 1.0e-9)
+				{
+					nWorld[0] /= nl; nWorld[1] /= nl; nWorld[2] /= nl;
+					real d = static_cast<real>(dist) + static_cast<real>(0.5) * particleRadius;
+					real dmin = static_cast<real>(2.0) * particleRadius;
+					if (d < dmin) d = dmin;
+					s.boundaryVolume[slot] = static_cast<real>(volume);
+					s.boundaryXj[slot] = make_r3(xi.x - d * static_cast<real>(nWorld[0]),
+												 xi.y - d * static_cast<real>(nWorld[1]),
+												 xi.z - d * static_cast<real>(nWorld[2]));
+				}
 			}
 		}
 	}
 }
 
-void launchComputeBoundary(const DeviceState &s, const DeviceBoundaryMap &bmap, real, cudaStream_t stream)
+void launchComputeBoundary(const DeviceState &s, real, cudaStream_t stream)
 {
-	kComputeBoundary<<<gridBlocks(s.n), kBlock, 0, stream>>>(s, bmap, s.supportRadius, s.particleRadius);
+	kComputeBoundary<<<gridBlocks(s.n), kBlock, 0, stream>>>(s, s.supportRadius, s.particleRadius);
 }
 
 // ---------------------------------------------------------------------------
 // Density and DFSPH factor
 // ---------------------------------------------------------------------------
-__global__ void kComputeDensity(DeviceState s, DeviceBoundaryMap m, CubicKernelC ker)
+__global__ void kComputeDensity(DeviceState s, CubicKernelC ker)
 {
 	unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
 	if (i >= s.n) return;
@@ -189,22 +195,26 @@ __global__ void kComputeDensity(DeviceState s, DeviceBoundaryMap m, CubicKernelC
 		}
 	);
 
-	const real bv = s.boundaryVolume[i];
-	if (bv > 0)
+	for (int b = 0; b < s.numMaps; ++b)
 	{
-		real r = sqrt(sqnorm(xi - s.boundaryXj[i]));
-		density += bv * cubicW(ker, r);
+		const unsigned int slot = static_cast<unsigned int>(b) * s.capacity + i;
+		const real bv = s.boundaryVolume[slot];
+		if (bv > 0)
+		{
+			real r = sqrt(sqnorm(xi - s.boundaryXj[slot]));
+			density += bv * cubicW(ker, r);
+		}
 	}
 
 	s.density[i] = density * s.density0;
 }
 
-void launchComputeDensity(const DeviceState &s, const DeviceBoundaryMap &bmap, CubicKernelC kernel, cudaStream_t stream)
+void launchComputeDensity(const DeviceState &s, CubicKernelC kernel, cudaStream_t stream)
 {
-	kComputeDensity<<<gridBlocks(s.n), kBlock, 0, stream>>>(s, bmap, kernel);
+	kComputeDensity<<<gridBlocks(s.n), kBlock, 0, stream>>>(s, kernel);
 }
 
-__global__ void kComputeFactor(DeviceState s, DeviceBoundaryMap m, CubicKernelC ker, real eps)
+__global__ void kComputeFactor(DeviceState s, CubicKernelC ker, real eps)
 {
 	unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
 	if (i >= s.n) return;
@@ -223,20 +233,24 @@ __global__ void kComputeFactor(DeviceState s, DeviceBoundaryMap m, CubicKernelC 
 		}
 	);
 
-	const real bv = s.boundaryVolume[i];
-	if (bv > 0)
+	for (int b = 0; b < s.numMaps; ++b)
 	{
-		real3 gpj = (-bv) * cubicGradW(ker, xi - s.boundaryXj[i]);
-		gradPi -= gpj;
+		const unsigned int slot = static_cast<unsigned int>(b) * s.capacity + i;
+		const real bv = s.boundaryVolume[slot];
+		if (bv > 0)
+		{
+			real3 gpj = (-bv) * cubicGradW(ker, xi - s.boundaryXj[slot]);
+			gradPi -= gpj;
+		}
 	}
 
 	sumGrad += sqnorm(gradPi);
 	s.factor[i] = (sumGrad > eps) ? (static_cast<real>(1.0) / sumGrad) : static_cast<real>(0.0);
 }
 
-void launchComputeFactor(const DeviceState &s, const DeviceBoundaryMap &bmap, CubicKernelC kernel, real eps, cudaStream_t stream)
+void launchComputeFactor(const DeviceState &s, CubicKernelC kernel, real eps, cudaStream_t stream)
 {
-	kComputeFactor<<<gridBlocks(s.n), kBlock, 0, stream>>>(s, bmap, kernel, eps);
+	kComputeFactor<<<gridBlocks(s.n), kBlock, 0, stream>>>(s, kernel, eps);
 }
 
 // ---------------------------------------------------------------------------
@@ -360,7 +374,7 @@ __device__ __forceinline__ unsigned int deviceCountFluidNeighbors(const DeviceSt
 // ---------------------------------------------------------------------------
 // Solver initialisation
 // ---------------------------------------------------------------------------
-__global__ void kDivergenceInit(DeviceState s, DeviceBoundaryMap m, CubicKernelC ker, real invH, int is2D, const real *dtPtr)
+__global__ void kDivergenceInit(DeviceState s, CubicKernelC ker, real invH, int is2D, const real *dtPtr)
 {
 	unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
 	if (i >= s.n) return;
@@ -369,11 +383,15 @@ __global__ void kDivergenceInit(DeviceState s, DeviceBoundaryMap m, CubicKernelC
 	const real3 xi = s.pos[i];
 	const real3 vi = s.vel[i];
 	real densityAdv = deviceDensityChange(s, ker, i);
-	const real bv = s.boundaryVolume[i];
-	if (bv > 0)
+	for (int b = 0; b < s.numMaps; ++b)
 	{
-		real3 vj = bmPointVelocity(m, s.boundaryXj[i]);
-		densityAdv += bv * dot(vi - vj, cubicGradW(ker, xi - s.boundaryXj[i]));
+		const unsigned int slot = static_cast<unsigned int>(b) * s.capacity + i;
+		const real bv = s.boundaryVolume[slot];
+		if (bv > 0)
+		{
+			real3 vj = bmPointVelocity(s.maps[b], s.boundaryXj[slot]);
+			densityAdv += bv * dot(vi - vj, cubicGradW(ker, xi - s.boundaryXj[slot]));
+		}
 	}
 	if (densityAdv < 0) densityAdv = 0;
 
@@ -392,13 +410,13 @@ __global__ void kDivergenceInit(DeviceState s, DeviceBoundaryMap m, CubicKernelC
 		s.pressureRho2V[i] = 0;
 }
 
-void launchDivergenceInit(const DeviceState &s, const DeviceBoundaryMap &bmap, CubicKernelC kernel, real dt, cudaStream_t stream, const real *dtPtr)
+void launchDivergenceInit(const DeviceState &s, CubicKernelC kernel, real dt, cudaStream_t stream, const real *dtPtr)
 {
 	const real invH = static_cast<real>(1.0) / dt;
-	kDivergenceInit<<<gridBlocks(s.n), kBlock, 0, stream>>>(s, bmap, kernel, invH, s.sim2D, dtPtr);
+	kDivergenceInit<<<gridBlocks(s.n), kBlock, 0, stream>>>(s, kernel, invH, s.sim2D, dtPtr);
 }
 
-__global__ void kPressureInit(DeviceState s, DeviceBoundaryMap m, CubicKernelC ker, real invH2, real h, const real *dtPtr)
+__global__ void kPressureInit(DeviceState s, CubicKernelC ker, real invH2, real h, const real *dtPtr)
 {
 	unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
 	if (i >= s.n) return;
@@ -413,11 +431,15 @@ __global__ void kPressureInit(DeviceState s, DeviceBoundaryMap m, CubicKernelC k
 			delta += dot(vi - s.vel[j], cubicGradW(ker, xi - s.pos[j]));
 	);
 	delta *= s.volume;
-	const real bv = s.boundaryVolume[i];
-	if (bv > 0)
+	for (int b = 0; b < s.numMaps; ++b)
 	{
-		real3 vj = bmPointVelocity(m, s.boundaryXj[i]);
-		delta += bv * dot(vi - vj, cubicGradW(ker, xi - s.boundaryXj[i]));
+		const unsigned int slot = static_cast<unsigned int>(b) * s.capacity + i;
+		const real bv = s.boundaryVolume[slot];
+		if (bv > 0)
+		{
+			real3 vj = bmPointVelocity(s.maps[b], s.boundaryXj[slot]);
+			delta += bv * dot(vi - vj, cubicGradW(ker, xi - s.boundaryXj[slot]));
+		}
 	}
 	real densityAdv = s.density[i] / s.density0 + h * delta;
 	s.densityAdv[i] = densityAdv;
@@ -431,16 +453,16 @@ __global__ void kPressureInit(DeviceState s, DeviceBoundaryMap m, CubicKernelC k
 		s.pressureRho2[i] = 0;
 }
 
-void launchPressureInit(const DeviceState &s, const DeviceBoundaryMap &bmap, CubicKernelC kernel, real dt, cudaStream_t stream, const real *dtPtr)
+void launchPressureInit(const DeviceState &s, CubicKernelC kernel, real dt, cudaStream_t stream, const real *dtPtr)
 {
 	const real invH2 = static_cast<real>(1.0) / (dt * dt);
-	kPressureInit<<<gridBlocks(s.n), kBlock, 0, stream>>>(s, bmap, kernel, invH2, dt, dtPtr);
+	kPressureInit<<<gridBlocks(s.n), kBlock, 0, stream>>>(s, kernel, invH2, dt, dtPtr);
 }
 
 // ---------------------------------------------------------------------------
 // Pressure accelerations and Jacobi iteration
 // ---------------------------------------------------------------------------
-__global__ void kComputePressureAccel(DeviceState s, DeviceBoundaryMap m, CubicKernelC ker,
+__global__ void kComputePressureAccel(DeviceState s, CubicKernelC ker,
 									   const real *pressure, real eps, int applyForce, BodyReactionAccum reaction)
 {
 	unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -468,24 +490,29 @@ __global__ void kComputePressureAccel(DeviceState s, DeviceBoundaryMap m, CubicK
 
 	if (fabs(p_rho2_i) > eps)
 	{
-		const real bv = s.boundaryVolume[i];
-		if (bv > 0)
+		for (int b = 0; b < s.numMaps; ++b)
 		{
-			real3 gpj = (-bv) * cubicGradW(ker, xi - s.boundaryXj[i]);
-			real3 a = p_rho2_i * gpj;
-			ai += a;
-			if (applyForce && m.isDynamic)
+			const unsigned int slot = static_cast<unsigned int>(b) * s.capacity + i;
+			const real bv = s.boundaryVolume[slot];
+			if (bv > 0)
 			{
-				real3 force = (-s.mass[i]) * a;
-				real3 xj = s.boundaryXj[i];
-				real3 com = make_r3(static_cast<real>(m.com[0]), static_cast<real>(m.com[1]), static_cast<real>(m.com[2]));
-				real3 torque = cross(xj - com, force);
-				atomicAdd(&reaction.force[0], static_cast<double>(force.x));
-				atomicAdd(&reaction.force[1], static_cast<double>(force.y));
-				atomicAdd(&reaction.force[2], static_cast<double>(force.z));
-				atomicAdd(&reaction.torque[0], static_cast<double>(torque.x));
-				atomicAdd(&reaction.torque[1], static_cast<double>(torque.y));
-				atomicAdd(&reaction.torque[2], static_cast<double>(torque.z));
+				real3 gpj = (-bv) * cubicGradW(ker, xi - s.boundaryXj[slot]);
+				real3 a = p_rho2_i * gpj;
+				ai += a;
+				const DeviceBoundaryMap &m = s.maps[b];
+				if (applyForce && m.isDynamic)
+				{
+					real3 force = (-s.mass[i]) * a;
+					real3 xj = s.boundaryXj[slot];
+					real3 com = make_r3(static_cast<real>(m.com[0]), static_cast<real>(m.com[1]), static_cast<real>(m.com[2]));
+					real3 torque = cross(xj - com, force);
+					atomicAdd(&reaction.force[3 * b + 0], static_cast<double>(force.x));
+					atomicAdd(&reaction.force[3 * b + 1], static_cast<double>(force.y));
+					atomicAdd(&reaction.force[3 * b + 2], static_cast<double>(force.z));
+					atomicAdd(&reaction.torque[3 * b + 0], static_cast<double>(torque.x));
+					atomicAdd(&reaction.torque[3 * b + 1], static_cast<double>(torque.y));
+					atomicAdd(&reaction.torque[3 * b + 2], static_cast<double>(torque.z));
+				}
 			}
 		}
 	}
@@ -493,11 +520,11 @@ __global__ void kComputePressureAccel(DeviceState s, DeviceBoundaryMap m, CubicK
 	s.pressureAccel[i] = ai;
 }
 
-void launchComputePressureAccel(const DeviceState &s, const DeviceBoundaryMap &bmap, CubicKernelC kernel,
+void launchComputePressureAccel(const DeviceState &s, CubicKernelC kernel,
 								const real *pressure, real eps, int applyBoundaryForces,
 								BodyReactionAccum reaction, cudaStream_t stream)
 {
-	kComputePressureAccel<<<gridBlocks(s.n), kBlock, 0, stream>>>(s, bmap, kernel, pressure, eps, applyBoundaryForces, reaction);
+	kComputePressureAccel<<<gridBlocks(s.n), kBlock, 0, stream>>>(s, kernel, pressure, eps, applyBoundaryForces, reaction);
 }
 
 __device__ __forceinline__ real deviceAijPj(const DeviceState &s, CubicKernelC ker, unsigned int i)
@@ -510,13 +537,17 @@ __device__ __forceinline__ real deviceAijPj(const DeviceState &s, CubicKernelC k
 			aij += dot(ai - s.pressureAccel[j], cubicGradW(ker, xi - s.pos[j]));
 	);
 	aij *= s.volume;
-	const real bv = s.boundaryVolume[i];
-	if (bv > 0)
-		aij += bv * dot(ai, cubicGradW(ker, xi - s.boundaryXj[i]));
+	for (int b = 0; b < s.numMaps; ++b)
+	{
+		const unsigned int slot = static_cast<unsigned int>(b) * s.capacity + i;
+		const real bv = s.boundaryVolume[slot];
+		if (bv > 0)
+			aij += bv * dot(ai, cubicGradW(ker, xi - s.boundaryXj[slot]));
+	}
 	return aij;
 }
 
-__global__ void kSolveIterate(DeviceState s, DeviceBoundaryMap m, CubicKernelC ker, real *pressure,
+__global__ void kSolveIterate(DeviceState s, CubicKernelC ker, real *pressure,
 							  real hFactor, int isPressure, int is2D, real density0, real *errScratch,
 							  const real *dtPtr)
 {
@@ -550,11 +581,11 @@ __global__ void kSolveIterate(DeviceState s, DeviceBoundaryMap m, CubicKernelC k
 	errScratch[i] = -density0 * residuum;
 }
 
-void launchSolveIterate(const DeviceState &s, const DeviceBoundaryMap &bmap, CubicKernelC kernel, real *pressure,
+void launchSolveIterate(const DeviceState &s, CubicKernelC kernel, real *pressure,
 						real hFactor, int isPressure, real, real *errScratch, cudaStream_t stream,
 						const real *dtPtr)
 {
-	kSolveIterate<<<gridBlocks(s.n), kBlock, 0, stream>>>(s, bmap, kernel, pressure, hFactor, isPressure, s.sim2D, s.density0, errScratch, dtPtr);
+	kSolveIterate<<<gridBlocks(s.n), kBlock, 0, stream>>>(s, kernel, pressure, hFactor, isPressure, s.sim2D, s.density0, errScratch, dtPtr);
 }
 
 // ---------------------------------------------------------------------------
@@ -589,17 +620,17 @@ void launchPressureFinalizeApply(const DeviceState &s, real dt, cudaStream_t str
 	kPressureFinalizeApply<<<gridBlocks(s.n), kBlock, 0, stream>>>(s, dt, dtPtr);
 }
 
-__global__ void kZeroReaction(BodyReactionAccum r)
+__global__ void kZeroReaction(BodyReactionAccum r, int numBodies)
 {
 	if (threadIdx.x == 0 && blockIdx.x == 0)
 	{
-		for (int k = 0; k < 3; ++k) { r.force[k] = 0; r.torque[k] = 0; }
+		for (int k = 0; k < 3 * numBodies; ++k) { r.force[k] = 0; r.torque[k] = 0; }
 	}
 }
 
-void launchZeroReaction(BodyReactionAccum reaction, cudaStream_t stream)
+void launchZeroReaction(BodyReactionAccum reaction, int numBodies, cudaStream_t stream)
 {
-	kZeroReaction<<<1, 1, 0, stream>>>(reaction);
+	kZeroReaction<<<1, 1, 0, stream>>>(reaction, numBodies);
 }
 
 // Device-side replica of the host solver-loop predicate

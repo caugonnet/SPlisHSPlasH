@@ -11,12 +11,12 @@ namespace SPH
 namespace cuda_dfsph
 {
 
-// Net reaction accumulators for one dynamic body (double precision for stable
-// summation across many particles).
+// Net reaction accumulators per boundary body (double precision for stable
+// summation across many particles). Layout: [3 * body + component].
 struct BodyReactionAccum
 {
-	double *force = nullptr;   // 3
-	double *torque = nullptr;  // 3
+	double *force = nullptr;   // 3 * numMaps
+	double *torque = nullptr;  // 3 * numMaps
 };
 
 // ---- Neighborhood ---------------------------------------------------------
@@ -28,14 +28,11 @@ size_t querySortTempBytes(unsigned int capacity);
 void launchBuildCellRanges(const DeviceState &s, cudaStream_t stream);
 
 // ---- Boundary (Bender2019) ------------------------------------------------
-void launchComputeBoundary(const DeviceState &s, const DeviceBoundaryMap &bmap,
-						   real dt, cudaStream_t stream);
+void launchComputeBoundary(const DeviceState &s, real dt, cudaStream_t stream);
 
 // ---- DFSPH core -----------------------------------------------------------
-void launchComputeDensity(const DeviceState &s, const DeviceBoundaryMap &bmap,
-						  CubicKernelC kernel, cudaStream_t stream);
-void launchComputeFactor(const DeviceState &s, const DeviceBoundaryMap &bmap,
-						 CubicKernelC kernel, real eps, cudaStream_t stream);
+void launchComputeDensity(const DeviceState &s, CubicKernelC kernel, cudaStream_t stream);
+void launchComputeFactor(const DeviceState &s, CubicKernelC kernel, real eps, cudaStream_t stream);
 
 void launchClearAccelGravity(const DeviceState &s, real3 gravity, cudaStream_t stream);
 void launchViscosityStandard(const DeviceState &s, CubicKernelC kernel,
@@ -51,22 +48,20 @@ void launchApplyPosition(const DeviceState &s, real dt, cudaStream_t stream,
 
 // Solver initialisation (warm start + factor scaling). dt is the timestep the
 // respective solver runs with.
-void launchDivergenceInit(const DeviceState &s, const DeviceBoundaryMap &bmap,
-						  CubicKernelC kernel, real dt, cudaStream_t stream,
+void launchDivergenceInit(const DeviceState &s, CubicKernelC kernel, real dt, cudaStream_t stream,
 						  const real *dtPtr = nullptr);
-void launchPressureInit(const DeviceState &s, const DeviceBoundaryMap &bmap,
-						CubicKernelC kernel, real dt, cudaStream_t stream,
+void launchPressureInit(const DeviceState &s, CubicKernelC kernel, real dt, cudaStream_t stream,
 						const real *dtPtr = nullptr);
 
 // Pressure accelerations from a given pressure array (p or p_v).
-void launchComputePressureAccel(const DeviceState &s, const DeviceBoundaryMap &bmap,
+void launchComputePressureAccel(const DeviceState &s,
 								CubicKernelC kernel, const real *pressure, real eps,
 								int applyBoundaryForces, BodyReactionAccum reaction,
 								cudaStream_t stream);
 
 // One Jacobi iteration. isPressure selects source term / hFactor semantics.
 // Writes per-particle (-density0*residuum) into errScratch for reduction.
-void launchSolveIterate(const DeviceState &s, const DeviceBoundaryMap &bmap,
+void launchSolveIterate(const DeviceState &s,
 						CubicKernelC kernel, real *pressure, real hFactor,
 						int isPressure, real eps, real *errScratch, cudaStream_t stream,
 						const real *dtPtr = nullptr);
@@ -78,7 +73,7 @@ void launchPressureFinalizeApply(const DeviceState &s, real dt, cudaStream_t str
 								 const real *dtPtr = nullptr);
 
 // Host <-> device staging of interleaved real3 arrays (packing).
-void launchZeroReaction(BodyReactionAccum reaction, cudaStream_t stream);
+void launchZeroReaction(BodyReactionAccum reaction, int numBodies, cudaStream_t stream);
 
 // Device-side solver-loop condition update (see kSolverLoopCond). Increments
 // *iter, computes avg = *errSum * invN (also stored to *avgOut for stats) and

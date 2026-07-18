@@ -20,7 +20,7 @@ Do **not** edit the plan file. Todo IDs below match the plan.
 | `conditional-graphs` | **done (validated 2026-07-18)** | Both solver loops run as CUDA Graph conditional `while` nodes via `stackable_ctx::while_graph_scope` when `cudaOrchestrator=StfConditional`. Bit-identical to the host-controlled loops over 100 steps. Zero host syncs per iteration. `StfGraph` still falls through to StfStream (milestone 7/9 territory). |
 | `whole-step-graph` (milestone 9) | **done for fixed dt (2026-07-18)** | `StfGraph` + `cflMethod=0`: the entire timestep (neighborhood, both conditional while loops, forces, integration) is recorded ONCE into a `launchable_graph` (`pop_prologue_shared`) and relaunched every step — 1 graph launch + 2 host syncs per step. Bit-identical to Direct stream. Fastest orchestrator at small/medium N. Adaptive CFL falls back to the StfStream path (the CFL readback splits the step). |
 | `async-visualization` | **mostly done (2026-07-18)** | Host mirror reduced from ~4 ms to <1 ms at 85k: lean mirror (pos/vel/density only; `cudaFullMirror` param restores the debug fields), pinned staging via new backend `allocHostPinned`, async D2H + one sync, and the scatter loop capped at 8 OpenMP threads (36-thread default cost ~2.8 ms in wake-up/contention with driver threads). Triple-buffered GUI snapshots still open. |
-| `motor-coupling` | pending | Reaction force/torque accumulation kernels + `updateBoundaryMapTransform` exist; PBD handoff not wired. |
+| `motor-coupling` | **done (validated 2026-07-18)** | Multi-boundary maps (device-resident array, per-map boundaryVolume/Xj slots `[map*capacity+i]`), per-step transform upload (H2D memcpy — no graph rebuild), per-body reaction accumulators, facade applies net force + torque-couple to dynamic bodies via `BoundaryModel::addForce` before the PBD step. MotorScene (tank + motor-driven paddle): bit-identical to CPU until first fluid–boundary contact, KE match within 0.6% under chaotic stirring; all orchestrators bit-identical to each other. 89k-particle motor scene: ~4.2 ms/step steady-state vs 44.7 ms CPU (~10.6×). |
 | `validate-benchmark` | pending | No parity/benchmark suite yet. |
 
 ### What is verified vs. not
@@ -364,7 +364,15 @@ record-once/relaunch-many is the right pattern.
 
 ## Known limitations / gotchas
 - Single fluid model only; multiple fluids fall back to CPU.
-- Only boundary index 0 is passed to kernels (`m_map0`); multi-boundary needs a device array of maps.
+- ~~Only boundary index 0~~ Multi-boundary supported since 2026-07-18: kernels
+  loop over a device-resident `s.maps[numMaps]` array with per-map
+  boundaryVolume/boundaryXj slots. Transforms are updated in place with one
+  small H2D copy per step, so moving bodies keep the recorded step graph valid.
+- Torque is handed to `BoundaryModel::addForce` as a force at the body position
+  plus a two-force couple (the public API has no addTorque).
+- With the solver on the GPU, the DFSPH_CUDA facade caps OpenMP to 8 threads
+  unless OMP_NUM_THREADS is set: a cold 36-thread pool cost ~5 ms per PBD call
+  (and ~3 ms in the mirror scatter) in wake-up/contention with the CUDA driver.
 - CFL method 2 approximated as method 1.
 - Boundary viscosity term not ported (scenes set it to 0).
 - No parity tests, no `Tests/CUDA/` targets yet.

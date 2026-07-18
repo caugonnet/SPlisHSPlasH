@@ -53,6 +53,11 @@ namespace SPH
 		std::vector<MapStorage> m_mapStorage;
 		std::vector<cuda_dfsph::BoundaryMapDesc> m_mapDescs;
 
+		// Per-step rigid-body transforms handed to the backend (motor coupling)
+		// and reaction buffers read back from it.
+		std::vector<double> m_bodyR, m_bodyT, m_bodyAV, m_bodyLV, m_bodyCom;
+		std::vector<cuda_dfsph::BoundaryReaction> m_reactions;
+
 		void ensureInitialized();
 		void ensurePinned(unsigned int n);
 		void buildSceneDesc(cuda_dfsph::SceneDesc &scene);

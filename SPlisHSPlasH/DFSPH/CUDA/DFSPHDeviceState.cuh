@@ -100,6 +100,8 @@ __device__ __forceinline__ real3 cubicGradW(const CubicKernelC &c, real3 r)
 
 // Fixed-capacity, device-resident DFSPH state. All pointers are device memory.
 // Passed to kernels by value (POD).
+struct DeviceBoundaryMap;
+
 struct DeviceState
 {
 	unsigned int n = 0;         // active particle count
@@ -136,10 +138,15 @@ struct DeviceState
 	unsigned int *cellStart = nullptr;  // numCells
 	unsigned int *cellEnd = nullptr;    // numCells
 
-	// Per-particle boundary contribution (single boundary supported for the
-	// first slice; index 0). volume<=0 means no boundary neighbor.
-	real *boundaryVolume = nullptr;     // capacity
-	real3 *boundaryXj = nullptr;        // capacity
+	// Per-particle boundary contributions, one slot per boundary map:
+	// index [map * capacity + i]. volume<=0 means no boundary neighbor.
+	real *boundaryVolume = nullptr;     // numMaps * capacity
+	real3 *boundaryXj = nullptr;        // numMaps * capacity
+
+	// Device-resident boundary maps (transforms updated in place each step, so
+	// moving bodies do not invalidate a recorded CUDA graph).
+	const DeviceBoundaryMap *maps = nullptr;
+	int numMaps = 0;
 };
 
 __device__ __forceinline__ int3 cellCoord(const DeviceState &s, real3 x)

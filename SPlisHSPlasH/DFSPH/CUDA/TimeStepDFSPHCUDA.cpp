@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <limits>
@@ -410,6 +411,19 @@ void TimeStepDFSPHCUDA::ensureInitialized()
 	if (m_initialized)
 		return;
 
+#ifdef _OPENMP
+	// With the solver on the GPU, the remaining host-side OpenMP loops (PBD
+	// rigid bodies, mirror scatter, exporters) are small; a large thread pool
+	// costs milliseconds per call in wake-up latency and contention with the
+	// CUDA driver threads (measured: PBD 5 ms vs 0.03 ms per call at 36 vs 8
+	// threads). Cap the pool unless the user set OMP_NUM_THREADS explicitly.
+	if (std::getenv("OMP_NUM_THREADS") == nullptr && omp_get_max_threads() > 8)
+	{
+		omp_set_num_threads(8);
+		LOG_INFO << "DFSPH_CUDA: capping OpenMP threads to 8 (set OMP_NUM_THREADS to override).";
+	}
+#endif
+
 	if (m_runFeatureProbes)
 	{
 		const bool ok = cuda_dfsph::dfsph_cuda_run_feature_probes(true);
@@ -455,6 +469,48 @@ void TimeStepDFSPHCUDA::step()
 	sd.gravity[2] = static_cast<cuda_dfsph::cudsph_real>(grav[2]);
 	sd.orchestrator = static_cast<cuda_dfsph::Orchestrator>(m_orchestrator);
 
+	// Hand the current rigid-body transforms to the backend when any boundary
+	// moves (PBD-simulated or animated bodies). Static scenes skip the upload.
+	const unsigned int nBoundaries = sim->numberOfBoundaryModels();
+	bool anyMoving = false;
+	for (unsigned int b = 0; b < nBoundaries; ++b)
+	{
+		RigidBodyObject *rbo = sim->getBoundaryModel(b)->getRigidBodyObject();
+		if (rbo->isDynamic() || rbo->isAnimated())
+			anyMoving = true;
+	}
+	if (anyMoving && nBoundaries > 0)
+	{
+		m_bodyR.resize(9 * nBoundaries);
+		m_bodyT.resize(3 * nBoundaries);
+		m_bodyAV.resize(3 * nBoundaries);
+		m_bodyLV.resize(3 * nBoundaries);
+		m_bodyCom.resize(3 * nBoundaries);
+		for (unsigned int b = 0; b < nBoundaries; ++b)
+		{
+			RigidBodyObject *rbo = sim->getBoundaryModel(b)->getRigidBodyObject();
+			const Matrix3r R = rbo->getRotation().toRotationMatrix();
+			const Vector3r t = rbo->getPosition();
+			const Vector3r av = rbo->getAngularVelocity();
+			const Vector3r lv = rbo->getVelocity();
+			for (int r = 0; r < 3; ++r)
+				for (int c = 0; c < 3; ++c)
+					m_bodyR[9 * b + 3 * r + c] = static_cast<double>(R(r, c));
+			for (int d = 0; d < 3; ++d)
+			{
+				m_bodyT[3 * b + d] = static_cast<double>(t[d]);
+				m_bodyAV[3 * b + d] = static_cast<double>(av[d]);
+				m_bodyLV[3 * b + d] = static_cast<double>(lv[d]);
+				m_bodyCom[3 * b + d] = static_cast<double>(t[d]);
+			}
+		}
+		sd.bodyRotation = m_bodyR.data();
+		sd.bodyTranslation = m_bodyT.data();
+		sd.bodyAngularVel = m_bodyAV.data();
+		sd.bodyLinearVel = m_bodyLV.data();
+		sd.bodyComPosition = m_bodyCom.data();
+	}
+
 	cuda_dfsph::StepStats stats;
 	{
 		START_TIMING("DFSPH_CUDA_step");
@@ -464,6 +520,42 @@ void TimeStepDFSPHCUDA::step()
 
 	m_iterations = stats.iterations;
 	m_iterationsV = stats.iterationsV;
+
+	// Two-way coupling: hand the net fluid reaction (force + torque about the
+	// body position) to each dynamic boundary. BoundaryModel::addForce only
+	// takes point forces, so the torque is applied as a couple.
+	if (anyMoving && nBoundaries > 0)
+	{
+		m_reactions.assign(nBoundaries, cuda_dfsph::BoundaryReaction());
+		m_backend->getBoundaryReactions(m_reactions.data());
+		for (unsigned int b = 0; b < nBoundaries; ++b)
+		{
+			BoundaryModel *bm = sim->getBoundaryModel(b);
+			RigidBodyObject *rbo = bm->getRigidBodyObject();
+			if (!rbo->isDynamic())
+				continue;
+			const Vector3r F(static_cast<Real>(m_reactions[b].force[0]),
+							 static_cast<Real>(m_reactions[b].force[1]),
+							 static_cast<Real>(m_reactions[b].force[2]));
+			const Vector3r tau(static_cast<Real>(m_reactions[b].torque[0]),
+							   static_cast<Real>(m_reactions[b].torque[1]),
+							   static_cast<Real>(m_reactions[b].torque[2]));
+			const Vector3r com = rbo->getPosition();
+			bm->addForce(com, F); // zero torque contribution about the body position
+			if (tau.squaredNorm() > static_cast<Real>(0.0))
+			{
+				// Couple 2*(u x g) = tau with unit u perpendicular to tau.
+				Vector3r e = (std::fabs(tau[0]) < std::fabs(tau[2])) ? Vector3r::UnitX() : Vector3r::UnitZ();
+				Vector3r u = tau.cross(e);
+				if (u.squaredNorm() < static_cast<Real>(1e-12))
+					u = tau.cross(Vector3r::UnitY());
+				u.normalize();
+				const Vector3r g = static_cast<Real>(0.5) * tau.cross(u);
+				bm->addForce(com + u, g);
+				bm->addForce(com - u, -g);
+			}
+		}
+	}
 
 	// Mirror device state to the host so existing visualization/export works.
 	{

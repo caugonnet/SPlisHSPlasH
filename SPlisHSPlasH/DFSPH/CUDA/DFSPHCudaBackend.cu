@@ -121,9 +121,11 @@ private:
 	real m_cflFactor = 1, m_cflMin = static_cast<real>(1e-5), m_cflMax = static_cast<real>(0.005);
 	real m_suggestedDt = 0;
 
-	// boundary maps (single supported for kernels; index 0)
+	// Boundary maps: host copies (transform updated per step) mirrored into a
+	// device array read by the kernels (s.maps), so moving bodies neither bake
+	// stale transforms into kernel arguments nor invalidate a recorded graph.
 	std::vector<DeviceBoundaryMap> m_maps;
-	DeviceBoundaryMap m_map0{}; // primary map passed to kernels (valid==0 if none)
+	DeviceBoundaryMap *m_dMaps = nullptr;
 
 	// scratch
 	unsigned int *m_baseKey = nullptr;  // fixed allocation for unsorted keys
@@ -257,8 +259,9 @@ void DFSPHCudaBackendImpl::initialize(const SceneDesc &scene)
 	m_s.pressureRho2 = devAlloc<real>(cap);
 	m_s.pressureRho2V = devAlloc<real>(cap);
 	m_s.state = devAlloc<int>(cap);
-	m_s.boundaryVolume = devAlloc<real>(cap);
-	m_s.boundaryXj = devAlloc<real3>(cap);
+	// Sized after the boundary maps are known (see below).
+	m_s.boundaryVolume = nullptr;
+	m_s.boundaryXj = nullptr;
 
 	// Grid.
 	m_baseKey = devAlloc<unsigned int>(cap);
@@ -279,14 +282,21 @@ void DFSPHCudaBackendImpl::initialize(const SceneDesc &scene)
 	cudaCheck(cudaMemset(m_s.pressureRho2, 0, cap * sizeof(real)), "clear p");
 	cudaCheck(cudaMemset(m_s.pressureRho2V, 0, cap * sizeof(real)), "clear pv");
 
-	// Boundary maps.
+	// Boundary maps: upload node/cell data per map, then mirror the descriptor
+	// structs (including transforms) into a device array for the kernels.
 	m_maps.clear();
 	for (int b = 0; b < scene.numBoundaries; ++b)
 		m_maps.push_back(uploadBoundaryMap(scene.boundaries[b]));
-	if (!m_maps.empty())
-		m_map0 = m_maps[0];
-	else
-		m_map0.valid = 0;
+	const int numMaps = static_cast<int>(m_maps.size());
+	m_s.numMaps = numMaps;
+	m_dMaps = devAlloc<DeviceBoundaryMap>(numMaps > 0 ? numMaps : 1);
+	if (numMaps > 0)
+		cudaCheck(cudaMemcpy(m_dMaps, m_maps.data(), numMaps * sizeof(DeviceBoundaryMap), cudaMemcpyHostToDevice), "maps H2D");
+	m_s.maps = m_dMaps;
+
+	const unsigned int mapSlots = (numMaps > 0 ? numMaps : 1) * cap;
+	m_s.boundaryVolume = devAlloc<real>(mapSlots);
+	m_s.boundaryXj = devAlloc<real3>(mapSlots);
 
 	// Scratch: size cub temp for the largest of sort / reduce.
 	size_t sortBytes = querySortTempBytes(cap);
@@ -307,9 +317,12 @@ void DFSPHCudaBackendImpl::initialize(const SceneDesc &scene)
 	m_dDt = devAlloc<real>(2);
 	cudaCheck(cudaMemset(m_dDt, 0, 2 * sizeof(real)), "clear dt");
 	m_lastDtUsed = -1;
-	m_reaction.force = devAlloc<double>(3);
-	m_reaction.torque = devAlloc<double>(3);
-	cudaCheck(cudaMallocHost(&m_hReaction, 6 * sizeof(double)), "pinned reaction");
+	const int reactionSlots = 3 * (numMaps > 0 ? numMaps : 1);
+	m_reaction.force = devAlloc<double>(reactionSlots);
+	m_reaction.torque = devAlloc<double>(reactionSlots);
+	cudaCheck(cudaMemset(m_reaction.force, 0, reactionSlots * sizeof(double)), "clear rf");
+	cudaCheck(cudaMemset(m_reaction.torque, 0, reactionSlots * sizeof(double)), "clear rt");
+	cudaCheck(cudaMallocHost(&m_hReaction, 2 * reactionSlots * sizeof(double)), "pinned reaction");
 
 	m_ready = true;
 }
@@ -391,8 +404,8 @@ void DFSPHCudaBackendImpl::recordSolverLoop(stf::stackable_ctx &sctx, Tok &tok,
 		// buffers; the token serializes against the surrounding phases and the
 		// loop-continue flag orders update_cond after the body.
 		sctx.task(tok.rw(), tokIter.rw(), lCond.write())->*[=](cudaStream_t s, auto cond) {
-			launchComputePressureAccel(m_s, m_map0, m_kernel, pressure, m_eps, 0, m_reaction, s);
-			launchSolveIterate(m_s, m_map0, m_kernel, pressure, hFactor, isPressure, m_eps, m_errScratch, s, dtPtr);
+			launchComputePressureAccel(m_s, m_kernel, pressure, m_eps, 0, m_reaction, s);
+			launchSolveIterate(m_s, m_kernel, pressure, hFactor, isPressure, m_eps, m_errScratch, s, dtPtr);
 			size_t bytes = m_cubTempBytes;
 			cub::DeviceReduce::Sum(m_cubTemp, bytes, m_errScratch, m_dReduce, static_cast<int>(m_s.n), s);
 			launchSolverLoopCond(m_dReduce, dIter, dAvg, cond.addr, invN, eta, minIter, maxIter, s, dtPtr, etaOverDt);
@@ -434,7 +447,9 @@ void DFSPHCudaBackendImpl::runTimestepGraph(const StepDesc &sd, StepStats &stats
 	const real dt0 = sd.dt;
 	const real3 gravity = make_r3(sd.gravity[0], sd.gravity[1], sd.gravity[2]);
 
-	// Refresh moving-body transform if provided (motor coupling stage 1).
+	// Refresh moving-body transforms in the device map array (motor coupling).
+	// A plain H2D copy: the kernels read the maps from device memory, so the
+	// recorded graph stays valid.
 	if (sd.bodyRotation && !m_maps.empty())
 	{
 		for (size_t b = 0; b < m_maps.size(); ++b)
@@ -444,7 +459,8 @@ void DFSPHCudaBackendImpl::runTimestepGraph(const StepDesc &sd, StepStats &stats
 									   sd.bodyAngularVel + 3 * b, sd.bodyLinearVel + 3 * b,
 									   sd.bodyComPosition + 3 * b);
 		}
-		m_map0 = m_maps[0];
+		cudaCheck(cudaMemcpyAsync(m_dMaps, m_maps.data(), m_maps.size() * sizeof(DeviceBoundaryMap),
+								  cudaMemcpyHostToDevice, stream), "maps H2D");
 	}
 
 	cudaCheck(cudaStreamSynchronize(stream), "pre-graph sync");
@@ -462,15 +478,12 @@ void DFSPHCudaBackendImpl::runTimestepGraph(const StepDesc &sd, StepStats &stats
 		m_lastDtUsed = dt0;
 	}
 
-	// The recorded graph is only a function of gravity and the boundary
-	// transforms (dt lives in device memory; all pointers, counts and solver
-	// parameters are fixed after initialize()). Rebuild when any of these
-	// change; otherwise relaunch the stored executable graph. Moving bodies
-	// bake a new m_map0 into the kernel arguments, so they force a rebuild
-	// every step for now.
+	// The recorded graph is only a function of gravity (dt and the boundary
+	// transforms live in device memory; all pointers, counts and solver
+	// parameters are fixed after initialize()). Rebuild only when gravity
+	// changes; otherwise relaunch the stored executable graph.
 	const bool rebuild = !m_stepGraph.valid()
-		|| m_graphGrav[0] != gravity.x || m_graphGrav[1] != gravity.y || m_graphGrav[2] != gravity.z
-		|| sd.bodyRotation != nullptr;
+		|| m_graphGrav[0] != gravity.x || m_graphGrav[1] != gravity.y || m_graphGrav[2] != gravity.z;
 	if (rebuild)
 	{
 		// Release the previous pop before pushing again (push() is forbidden
@@ -494,12 +507,12 @@ void DFSPHCudaBackendImpl::runTimestepGraph(const StepDesc &sd, StepStats &stats
 		// particle positions, not on the sorted grid — a separate token lets STF
 		// run it concurrently with the whole neighborhood build.
 		sctx.task(tokBoundary.rw())->*[=](cudaStream_t s) {
-			launchComputeBoundary(m_s, m_map0, dt0, s);
+			launchComputeBoundary(m_s, dt0, s);
 		};
 		// 3-4. Density and DFSPH factor join both branches.
 		sctx.task(tok.rw(), tokBoundary.rw())->*[=](cudaStream_t s) {
-			launchComputeDensity(m_s, m_map0, m_kernel, s);
-			launchComputeFactor(m_s, m_map0, m_kernel, m_eps, s);
+			launchComputeDensity(m_s, m_kernel, s);
+			launchComputeFactor(m_s, m_kernel, m_eps, s);
 		};
 
 		// 5. Divergence solve (uses dt0).
@@ -509,12 +522,12 @@ void DFSPHCudaBackendImpl::runTimestepGraph(const StepDesc &sd, StepStats &stats
 			// kernel divides by the device dt each iteration.
 			const real etaVBase = m_maxErrorV * static_cast<real>(0.01) * m_s.density0;
 			sctx.task(tok.rw())->*[=](cudaStream_t s) {
-				launchDivergenceInit(m_s, m_map0, m_kernel, dt0, s, m_dDt + 0);
+				launchDivergenceInit(m_s, m_kernel, dt0, s, m_dDt + 0);
 			};
 			recordSolverLoop(sctx, tok, m_s.pressureRho2V, dt0, 0, etaVBase, 1, m_maxIterationsV, 0, m_dDt + 0);
 			sctx.task(tok.rw())->*[=](cudaStream_t s) {
-				launchZeroReaction(m_reaction, s);
-				launchComputePressureAccel(m_s, m_map0, m_kernel, m_s.pressureRho2V, m_eps, 1, m_reaction, s);
+				launchZeroReaction(m_reaction, m_s.numMaps, s);
+				launchComputePressureAccel(m_s, m_kernel, m_s.pressureRho2V, m_eps, 1, m_reaction, s);
 				launchDivergenceFinalizeApply(m_s, dt0, s, m_dDt + 0);
 			};
 		}
@@ -532,7 +545,7 @@ void DFSPHCudaBackendImpl::runTimestepGraph(const StepDesc &sd, StepStats &stats
 			launchCflUpdateDt(m_dReduce, m_dDt, m_cflFactor, static_cast<real>(2.0) * m_s.particleRadius,
 							  m_cflMin, m_cflMax, (m_cflMethod != 0) ? 1 : 0, s);
 			launchApplyVelocityUpdate(m_s, dt0, s, m_dDt + 1);
-			launchPressureInit(m_s, m_map0, m_kernel, dt0, s, m_dDt + 1);
+			launchPressureInit(m_s, m_kernel, dt0, s, m_dDt + 1);
 		};
 
 		// 10. Pressure solve (eta is dt-independent).
@@ -541,12 +554,13 @@ void DFSPHCudaBackendImpl::runTimestepGraph(const StepDesc &sd, StepStats &stats
 
 		// 11. Finalize, integrate positions, fetch reaction totals.
 		sctx.task(tok.rw())->*[=](cudaStream_t s) {
-			launchZeroReaction(m_reaction, s);
-			launchComputePressureAccel(m_s, m_map0, m_kernel, m_s.pressureRho2, m_eps, 1, m_reaction, s);
+			launchZeroReaction(m_reaction, m_s.numMaps, s);
+			launchComputePressureAccel(m_s, m_kernel, m_s.pressureRho2, m_eps, 1, m_reaction, s);
 			launchPressureFinalizeApply(m_s, dt0, s, m_dDt + 1);
 			launchApplyPosition(m_s, dt0, s, m_dDt + 1);
-			cudaMemcpyAsync(m_hReaction, m_reaction.force, 3 * sizeof(double), cudaMemcpyDeviceToHost, s);
-			cudaMemcpyAsync(m_hReaction + 3, m_reaction.torque, 3 * sizeof(double), cudaMemcpyDeviceToHost, s);
+			const int rslots = 3 * (m_s.numMaps > 0 ? m_s.numMaps : 1);
+			cudaMemcpyAsync(m_hReaction, m_reaction.force, rslots * sizeof(double), cudaMemcpyDeviceToHost, s);
+			cudaMemcpyAsync(m_hReaction + rslots, m_reaction.torque, rslots * sizeof(double), cudaMemcpyDeviceToHost, s);
 		};
 
 		m_stepGraph = sctx.pop_prologue_shared();
@@ -585,7 +599,7 @@ void DFSPHCudaBackendImpl::runTimestep(const StepDesc &sd, StepStats &stats, cud
 	const real dt0 = sd.dt;
 	const real3 gravity = make_r3(sd.gravity[0], sd.gravity[1], sd.gravity[2]);
 
-	// Refresh moving-body transform if provided (motor coupling stage 1).
+	// Refresh moving-body transforms in the device map array (motor coupling).
 	if (sd.bodyRotation && !m_maps.empty())
 	{
 		for (size_t b = 0; b < m_maps.size(); ++b)
@@ -595,18 +609,19 @@ void DFSPHCudaBackendImpl::runTimestep(const StepDesc &sd, StepStats &stats, cud
 									   sd.bodyAngularVel + 3 * b, sd.bodyLinearVel + 3 * b,
 									   sd.bodyComPosition + 3 * b);
 		}
-		m_map0 = m_maps[0];
+		cudaCheck(cudaMemcpyAsync(m_dMaps, m_maps.data(), m_maps.size() * sizeof(DeviceBoundaryMap),
+								  cudaMemcpyHostToDevice, stream), "maps H2D");
 	}
 
 	// 1. Neighborhood.
 	neighborhood(stream);
 
 	// 2. Boundary contribution (Bender2019 volume map).
-	launchComputeBoundary(m_s, m_map0, dt0, stream);
+	launchComputeBoundary(m_s, dt0, stream);
 
 	// 3. Density + 4. DFSPH factor.
-	launchComputeDensity(m_s, m_map0, m_kernel, stream);
-	launchComputeFactor(m_s, m_map0, m_kernel, m_eps, stream);
+	launchComputeDensity(m_s, m_kernel, stream);
+	launchComputeFactor(m_s, m_kernel, m_eps, stream);
 
 	const bool deviceLoops = (sd.orchestrator == Orchestrator::StfConditional);
 
@@ -614,7 +629,7 @@ void DFSPHCudaBackendImpl::runTimestep(const StepDesc &sd, StepStats &stats, cud
 	unsigned int itersV = 0;
 	if (m_enableDivergence)
 	{
-		launchDivergenceInit(m_s, m_map0, m_kernel, dt0, stream);
+		launchDivergenceInit(m_s, m_kernel, dt0, stream);
 		const real eta = (static_cast<real>(1.0) / dt0) * m_maxErrorV * static_cast<real>(0.01) * m_s.density0;
 		if (deviceLoops)
 		{
@@ -627,8 +642,8 @@ void DFSPHCudaBackendImpl::runTimestep(const StepDesc &sd, StepStats &stats, cud
 			bool chk = false;
 			while ((!chk || itersV < 1) && itersV < m_maxIterationsV)
 			{
-				launchComputePressureAccel(m_s, m_map0, m_kernel, m_s.pressureRho2V, m_eps, 0, m_reaction, stream);
-				launchSolveIterate(m_s, m_map0, m_kernel, m_s.pressureRho2V, dt0, 0, m_eps, m_errScratch, stream);
+				launchComputePressureAccel(m_s, m_kernel, m_s.pressureRho2V, m_eps, 0, m_reaction, stream);
+				launchSolveIterate(m_s, m_kernel, m_s.pressureRho2V, dt0, 0, m_eps, m_errScratch, stream);
 				real err = reduceSum(m_errScratch, stream);
 				real avg = err / static_cast<real>(m_s.n);
 				stats.avgDensityErrV = avg;
@@ -636,8 +651,8 @@ void DFSPHCudaBackendImpl::runTimestep(const StepDesc &sd, StepStats &stats, cud
 				++itersV;
 			}
 		}
-		launchZeroReaction(m_reaction, stream);
-		launchComputePressureAccel(m_s, m_map0, m_kernel, m_s.pressureRho2V, m_eps, 1, m_reaction, stream);
+		launchZeroReaction(m_reaction, m_s.numMaps, stream);
+		launchComputePressureAccel(m_s, m_kernel, m_s.pressureRho2V, m_eps, 1, m_reaction, stream);
 		launchDivergenceFinalizeApply(m_s, dt0, stream);
 	}
 	stats.iterationsV = itersV;
@@ -669,7 +684,7 @@ void DFSPHCudaBackendImpl::runTimestep(const StepDesc &sd, StepStats &stats, cud
 	// 10. Pressure solve (uses dtUsed).
 	unsigned int iters = 0;
 	{
-		launchPressureInit(m_s, m_map0, m_kernel, dtUsed, stream);
+		launchPressureInit(m_s, m_kernel, dtUsed, stream);
 		const real eta = m_maxError * static_cast<real>(0.01) * m_s.density0;
 		const real hFactor = dtUsed * dtUsed;
 		if (deviceLoops)
@@ -683,8 +698,8 @@ void DFSPHCudaBackendImpl::runTimestep(const StepDesc &sd, StepStats &stats, cud
 			bool chk = false;
 			while ((!chk || iters < m_minIterations) && iters < m_maxIterations)
 			{
-				launchComputePressureAccel(m_s, m_map0, m_kernel, m_s.pressureRho2, m_eps, 0, m_reaction, stream);
-				launchSolveIterate(m_s, m_map0, m_kernel, m_s.pressureRho2, hFactor, 1, m_eps, m_errScratch, stream);
+				launchComputePressureAccel(m_s, m_kernel, m_s.pressureRho2, m_eps, 0, m_reaction, stream);
+				launchSolveIterate(m_s, m_kernel, m_s.pressureRho2, hFactor, 1, m_eps, m_errScratch, stream);
 				real err = reduceSum(m_errScratch, stream);
 				real avg = err / static_cast<real>(m_s.n);
 				stats.avgDensityErr = avg;
@@ -692,8 +707,8 @@ void DFSPHCudaBackendImpl::runTimestep(const StepDesc &sd, StepStats &stats, cud
 				++iters;
 			}
 		}
-		launchZeroReaction(m_reaction, stream);
-		launchComputePressureAccel(m_s, m_map0, m_kernel, m_s.pressureRho2, m_eps, 1, m_reaction, stream);
+		launchZeroReaction(m_reaction, m_s.numMaps, stream);
+		launchComputePressureAccel(m_s, m_kernel, m_s.pressureRho2, m_eps, 1, m_reaction, stream);
 		launchPressureFinalizeApply(m_s, dtUsed, stream);
 	}
 	stats.iterations = iters;
@@ -702,8 +717,9 @@ void DFSPHCudaBackendImpl::runTimestep(const StepDesc &sd, StepStats &stats, cud
 	launchApplyPosition(m_s, dtUsed, stream);
 
 	// Fetch reaction totals (valid after the pressure finalize).
-	cudaCheck(cudaMemcpyAsync(m_hReaction, m_reaction.force, 3 * sizeof(double), cudaMemcpyDeviceToHost, stream), "reaction force D2H");
-	cudaCheck(cudaMemcpyAsync(m_hReaction + 3, m_reaction.torque, 3 * sizeof(double), cudaMemcpyDeviceToHost, stream), "reaction torque D2H");
+	const int rslots = 3 * (m_s.numMaps > 0 ? m_s.numMaps : 1);
+	cudaCheck(cudaMemcpyAsync(m_hReaction, m_reaction.force, rslots * sizeof(double), cudaMemcpyDeviceToHost, stream), "reaction force D2H");
+	cudaCheck(cudaMemcpyAsync(m_hReaction + rslots, m_reaction.torque, rslots * sizeof(double), cudaMemcpyDeviceToHost, stream), "reaction torque D2H");
 
 	cudaCheck(cudaStreamSynchronize(stream), "step sync");
 	stats.dtUsed = dtUsed;
@@ -797,11 +813,15 @@ void DFSPHCudaBackendImpl::copyStateToHost(const HostMirror &mirror)
 void DFSPHCudaBackendImpl::getBoundaryReactions(BoundaryReaction *out) const
 {
 	if (!out) return;
-	// Only one dynamic body is accumulated for now (index 0).
-	for (int d = 0; d < 3; ++d)
+	const int numMaps = m_s.numMaps > 0 ? m_s.numMaps : 1;
+	const int rslots = 3 * numMaps;
+	for (int b = 0; b < m_s.numMaps; ++b)
 	{
-		out[0].force[d] = m_hReaction ? m_hReaction[d] : 0.0;
-		out[0].torque[d] = m_hReaction ? m_hReaction[3 + d] : 0.0;
+		for (int d = 0; d < 3; ++d)
+		{
+			out[b].force[d] = m_hReaction ? m_hReaction[3 * b + d] : 0.0;
+			out[b].torque[d] = m_hReaction ? m_hReaction[rslots + 3 * b + d] : 0.0;
+		}
 	}
 }
 
@@ -829,6 +849,7 @@ void DFSPHCudaBackendImpl::destroy()
 	cudaFree(m_cubTemp); cudaFree(m_dReduce); cudaFree(m_dIter); cudaFree(m_dErrOut); cudaFree(m_dDt);
 	if (m_hReduce) cudaFreeHost(m_hReduce);
 	cudaFree(m_reaction.force); cudaFree(m_reaction.torque);
+	cudaFree(m_dMaps); m_dMaps = nullptr;
 	if (m_hReaction) cudaFreeHost(m_hReaction);
 	for (auto &m : m_maps) freeBoundaryMap(m);
 	m_maps.clear();
