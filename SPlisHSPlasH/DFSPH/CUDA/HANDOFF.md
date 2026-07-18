@@ -19,7 +19,7 @@ Do **not** edit the plan file. Todo IDs below match the plan.
 | `double-dam-correctness` | **done (validated 2026-07-18)** | GPU DoubleDamBreak runs end-to-end (no crash/NaN, all 4 probes PASS). Fixed-dt parity vs. CPU DFSPH: step 1 matches to fp32 roundoff (max position diff 1.7e-6 m, density 1e-4 relative). See "Parity results" below. |
 | `conditional-graphs` | **done (validated 2026-07-18)** | Both solver loops run as CUDA Graph conditional `while` nodes via `stackable_ctx::while_graph_scope` when `cudaOrchestrator=StfConditional`. Bit-identical to the host-controlled loops over 100 steps. Zero host syncs per iteration. `StfGraph` still falls through to StfStream (milestone 7/9 territory). |
 | `whole-step-graph` (milestone 9) | **done for fixed dt (2026-07-18)** | `StfGraph` + `cflMethod=0`: the entire timestep (neighborhood, both conditional while loops, forces, integration) is recorded ONCE into a `launchable_graph` (`pop_prologue_shared`) and relaunched every step — 1 graph launch + 2 host syncs per step. Bit-identical to Direct stream. Fastest orchestrator at small/medium N. Adaptive CFL falls back to the StfStream path (the CFL readback splits the step). |
-| `async-visualization` | pending | Only full host-mirror after each step so far. |
+| `async-visualization` | **mostly done (2026-07-18)** | Host mirror reduced from ~4 ms to <1 ms at 85k: lean mirror (pos/vel/density only; `cudaFullMirror` param restores the debug fields), pinned staging via new backend `allocHostPinned`, async D2H + one sync, and the scatter loop capped at 8 OpenMP threads (36-thread default cost ~2.8 ms in wake-up/contention with driver threads). Triple-buffered GUI snapshots still open. |
 | `motor-coupling` | pending | Reaction force/torque accumulation kernels + `updateBoundaryMapTransform` exist; PBD handoff not wired. |
 | `validate-benchmark` | pending | No parity/benchmark suite yet. |
 
@@ -324,9 +324,15 @@ record-once/relaunch-many is the right pattern.
    device-resident dt (kernels reading dt from device memory) would let the
    adaptive-CFL path live inside the reusable graph too — needs kernels to take
    `const real* dt` instead of a baked host scalar.
-4. Triple-buffered render snapshots (`async-visualization`). This is now the
-   dominant end-to-end overhead: at 85k, SimStep ≈ 6.2 ms vs 2.2 ms GPU step —
-   ~4 ms is the unconditional full host mirror in `scatterHostState()`.
+4. ~~Reduce the per-step host mirror~~ **done 2026-07-18**: SimStep at 85k is
+   now ~3.3 ms steady-state (2.35 GPU + 0.95 mirror) vs 40.2 ms CPU ⇒ ~12×
+   end-to-end. Remaining ideas: true triple-buffered snapshots for the GUI
+   render path, and skipping the mirror entirely on steps with no export.
+   Profiling gotchas hit here (worth remembering): the ~150 ms one-time init
+   (probes + map export + graph record) is amortized into "Average time"
+   counters — check `DFSPH_CUDA_init`; and the CLI `--stopAt` did not override
+   the scene's `stopAt` in these runs, so "longer" runs may silently still be
+   100 steps.
 5. MotorScene one-way then two-way coupling (`motor-coupling`); the reaction
    accumulators (`BodyReactionAccum`, atomic double force/torque) and
    `updateBoundaryMapTransform` are already in place.

@@ -57,6 +57,17 @@ public:
 	void uploadState(const cudsph_real *positions, const cudsph_real *velocities, const int *particleState) override;
 	void step(const StepDesc &sd, StepStats &stats) override;
 	void copyStateToHost(const HostMirror &mirror) override;
+	cudsph_real *allocHostPinned(size_t count) override
+	{
+		cudsph_real *p = nullptr;
+		if (cudaMallocHost(&p, count * sizeof(cudsph_real)) != cudaSuccess)
+			return nullptr;
+		return p;
+	}
+	void freeHostPinned(cudsph_real *p) override
+	{
+		if (p) cudaFreeHost(p);
+	}
 	void getBoundaryReactions(BoundaryReaction *out) const override;
 	cudsph_real suggestedTimeStep() const override { return m_suggestedDt; }
 
@@ -710,8 +721,11 @@ void DFSPHCudaBackendImpl::copyStateToHost(const HostMirror &mirror)
 {
 	if (!m_ready) return;
 	const unsigned int n = m_s.n;
+	// Async copies + one sync: each blocking cudaMemcpy would pay a full device
+	// synchronization. Fastest when the destination arrays are pinned (the
+	// facade mirrors positions/velocities/density into pinned staging).
 	auto d2h = [&](void *dst, const void *src, size_t bytes) {
-		if (dst) cudaCheck(cudaMemcpy(dst, src, bytes, cudaMemcpyDeviceToHost), "state D2H");
+		if (dst) cudaCheck(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToHost, nullptr), "state D2H");
 	};
 	d2h(mirror.positions, m_s.pos, 3 * n * sizeof(real));
 	d2h(mirror.velocities, m_s.vel, 3 * n * sizeof(real));
@@ -721,6 +735,7 @@ void DFSPHCudaBackendImpl::copyStateToHost(const HostMirror &mirror)
 	d2h(mirror.pressureRho2, m_s.pressureRho2, n * sizeof(real));
 	d2h(mirror.pressureRho2V, m_s.pressureRho2V, n * sizeof(real));
 	d2h(mirror.pressureAccel, m_s.pressureAccel, 3 * n * sizeof(real));
+	cudaCheck(cudaStreamSynchronize(nullptr), "state D2H sync");
 }
 
 void DFSPHCudaBackendImpl::getBoundaryReactions(BoundaryReaction *out) const

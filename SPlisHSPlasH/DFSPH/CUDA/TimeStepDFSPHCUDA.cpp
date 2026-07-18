@@ -8,10 +8,14 @@
 #include "Utilities/Timing.h"
 #include "Utilities/Logger.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <limits>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 using namespace SPH;
 using namespace GenParam;
@@ -23,6 +27,7 @@ int TimeStepDFSPHCUDA::ENUM_ORCH_STF_STREAM = -1;
 int TimeStepDFSPHCUDA::ENUM_ORCH_STF_GRAPH = -1;
 int TimeStepDFSPHCUDA::ENUM_ORCH_STF_COND = -1;
 int TimeStepDFSPHCUDA::RUN_FEATURE_PROBES = -1;
+int TimeStepDFSPHCUDA::FULL_MIRROR = -1;
 
 // Backing storage for one flattened Bender2019 map. Kept alive on the facade so
 // the BoundaryMapDesc pointers stay valid across the initialize() call.
@@ -40,6 +45,11 @@ TimeStepDFSPHCUDA::TimeStepDFSPHCUDA()
 	, m_initialized(false)
 	, m_orchestrator(static_cast<int>(cuda_dfsph::Orchestrator::StfStream))
 	, m_runFeatureProbes(true)
+	, m_fullMirror(false)
+	, m_hPos(nullptr)
+	, m_hVel(nullptr)
+	, m_hDensity(nullptr)
+	, m_pinnedCapacity(0)
 {
 	m_backend = cuda_dfsph::createDFSPHCudaBackend();
 	m_deviceReady = (m_backend != nullptr);
@@ -49,8 +59,28 @@ TimeStepDFSPHCUDA::TimeStepDFSPHCUDA()
 
 TimeStepDFSPHCUDA::~TimeStepDFSPHCUDA(void)
 {
+	if (m_backend)
+	{
+		m_backend->freeHostPinned(m_hPos);
+		m_backend->freeHostPinned(m_hVel);
+		m_backend->freeHostPinned(m_hDensity);
+	}
+	m_hPos = m_hVel = m_hDensity = nullptr;
 	delete m_backend;
 	m_backend = nullptr;
+}
+
+void TimeStepDFSPHCUDA::ensurePinned(unsigned int n)
+{
+	if (n <= m_pinnedCapacity)
+		return;
+	m_backend->freeHostPinned(m_hPos);
+	m_backend->freeHostPinned(m_hVel);
+	m_backend->freeHostPinned(m_hDensity);
+	m_hPos = m_backend->allocHostPinned(3 * static_cast<size_t>(n));
+	m_hVel = m_backend->allocHostPinned(3 * static_cast<size_t>(n));
+	m_hDensity = m_backend->allocHostPinned(n);
+	m_pinnedCapacity = (m_hPos && m_hVel && m_hDensity) ? n : 0;
 }
 
 void TimeStepDFSPHCUDA::initParameters()
@@ -69,6 +99,10 @@ void TimeStepDFSPHCUDA::initParameters()
 	RUN_FEATURE_PROBES = createBoolParameter("cudaFeatureProbes", "Run CUDA feature probes", &m_runFeatureProbes);
 	setGroup(RUN_FEATURE_PROBES, "Simulation|DFSPH");
 	setDescription(RUN_FEATURE_PROBES, "Run the CCCL/CUDASTF capability probes once before the first GPU step.");
+
+	FULL_MIRROR = createBoolParameter("cudaFullMirror", "Mirror all solver fields", &m_fullMirror);
+	setGroup(FULL_MIRROR, "Simulation|DFSPH");
+	setDescription(FULL_MIRROR, "Copy the solver-internal fields (factor, advected density, pressures, pressure accel) to the host every step in addition to position/velocity/density. Needed only for debugging or when exporting those fields.");
 }
 
 void TimeStepDFSPHCUDA::reset()
@@ -221,8 +255,7 @@ void TimeStepDFSPHCUDA::gatherHostState()
 	FluidModel *model = sim->getFluidModel(0);
 	const unsigned int n = model->numActiveParticles();
 
-	m_hPos.resize(3 * n);
-	m_hVel.resize(3 * n);
+	ensurePinned(n);
 	m_hMass.resize(n);
 	m_hState.resize(n);
 	for (unsigned int i = 0; i < n; ++i)
@@ -246,25 +279,43 @@ void TimeStepDFSPHCUDA::scatterHostState()
 	FluidModel *model = sim->getFluidModel(0);
 	const unsigned int n = model->numActiveParticles();
 
-	m_hDensity.resize(n);
-	m_hFactor.resize(n);
-	m_hDensityAdv.resize(n);
-	m_hPressureRho2.resize(n);
-	m_hPressureRho2V.resize(n);
-	m_hPressureAccel.resize(3 * n);
+	ensurePinned(n);
 
 	cuda_dfsph::HostMirror mirror;
-	mirror.positions = m_hPos.data();
-	mirror.velocities = m_hVel.data();
-	mirror.density = m_hDensity.data();
-	mirror.factor = m_hFactor.data();
-	mirror.densityAdv = m_hDensityAdv.data();
-	mirror.pressureRho2 = m_hPressureRho2.data();
-	mirror.pressureRho2V = m_hPressureRho2V.data();
-	mirror.pressureAccel = m_hPressureAccel.data();
-	m_backend->copyStateToHost(mirror);
+	mirror.positions = m_hPos;
+	mirror.velocities = m_hVel;
+	mirror.density = m_hDensity;
+	// The solver-internal fields are only needed for debugging or when a scene
+	// exports them explicitly; the renderer and default exporters use
+	// position/velocity/density. copyStateToHost skips null pointers.
+	if (m_fullMirror)
+	{
+		m_hFactor.resize(n);
+		m_hDensityAdv.resize(n);
+		m_hPressureRho2.resize(n);
+		m_hPressureRho2V.resize(n);
+		m_hPressureAccel.resize(3 * n);
+		mirror.factor = m_hFactor.data();
+		mirror.densityAdv = m_hDensityAdv.data();
+		mirror.pressureRho2 = m_hPressureRho2.data();
+		mirror.pressureRho2V = m_hPressureRho2V.data();
+		mirror.pressureAccel = m_hPressureAccel.data();
+	}
+	{
+		START_TIMING("DFSPH_CUDA_mirror_d2h");
+		m_backend->copyStateToHost(mirror);
+		STOP_TIMING_AVG;
+	}
 
-	for (unsigned int i = 0; i < n; ++i)
+	START_TIMING("DFSPH_CUDA_mirror_loop");
+	// Memory-bound scatter: a few threads saturate bandwidth, while the OpenMP
+	// default (all hardware threads) costs milliseconds in wake-up/contention
+	// with the CUDA driver threads on many-core machines.
+#ifdef _OPENMP
+	const int mirrorThreads = std::min(8, omp_get_max_threads());
+#endif
+	#pragma omp parallel for schedule(static) num_threads(mirrorThreads)
+	for (int i = 0; i < static_cast<int>(n); ++i)
 	{
 		model->setPosition(i, Vector3r(static_cast<Real>(m_hPos[3 * i + 0]),
 									   static_cast<Real>(m_hPos[3 * i + 1]),
@@ -273,14 +324,18 @@ void TimeStepDFSPHCUDA::scatterHostState()
 									   static_cast<Real>(m_hVel[3 * i + 1]),
 									   static_cast<Real>(m_hVel[3 * i + 2])));
 		model->setDensity(i, static_cast<Real>(m_hDensity[i]));
-		m_simulationData.setFactor(0, i, static_cast<Real>(m_hFactor[i]));
-		m_simulationData.setDensityAdv(0, i, static_cast<Real>(m_hDensityAdv[i]));
-		m_simulationData.setPressureRho2(0, i, static_cast<Real>(m_hPressureRho2[i]));
-		m_simulationData.setPressureRho2_V(0, i, static_cast<Real>(m_hPressureRho2V[i]));
-		m_simulationData.setPressureAccel(0, i, Vector3r(static_cast<Real>(m_hPressureAccel[3 * i + 0]),
-														 static_cast<Real>(m_hPressureAccel[3 * i + 1]),
-														 static_cast<Real>(m_hPressureAccel[3 * i + 2])));
+		if (m_fullMirror)
+		{
+			m_simulationData.setFactor(0, i, static_cast<Real>(m_hFactor[i]));
+			m_simulationData.setDensityAdv(0, i, static_cast<Real>(m_hDensityAdv[i]));
+			m_simulationData.setPressureRho2(0, i, static_cast<Real>(m_hPressureRho2[i]));
+			m_simulationData.setPressureRho2_V(0, i, static_cast<Real>(m_hPressureRho2V[i]));
+			m_simulationData.setPressureAccel(0, i, Vector3r(static_cast<Real>(m_hPressureAccel[3 * i + 0]),
+															 static_cast<Real>(m_hPressureAccel[3 * i + 1]),
+															 static_cast<Real>(m_hPressureAccel[3 * i + 2])));
+		}
 	}
+	STOP_TIMING_AVG;
 }
 
 void TimeStepDFSPHCUDA::buildSceneDesc(cuda_dfsph::SceneDesc &scene)
@@ -293,8 +348,8 @@ void TimeStepDFSPHCUDA::buildSceneDesc(cuda_dfsph::SceneDesc &scene)
 
 	scene.numParticles = n;
 	scene.capacity = n;
-	scene.positions = m_hPos.data();
-	scene.velocities = m_hVel.data();
+	scene.positions = m_hPos;
+	scene.velocities = m_hVel;
 	scene.masses = m_hMass.data();
 	scene.particleState = m_hState.data();
 	scene.density0 = static_cast<cuda_dfsph::cudsph_real>(model->getDensity0());
@@ -386,7 +441,11 @@ void TimeStepDFSPHCUDA::step()
 		return;
 	}
 
+	// One-time cost (~150 ms: probes + boundary-map export + device init);
+	// shows up amortized in the SimStep average.
+	START_TIMING("DFSPH_CUDA_init");
 	ensureInitialized();
+	STOP_TIMING_AVG;
 
 	cuda_dfsph::StepDesc sd;
 	sd.dt = static_cast<cuda_dfsph::cudsph_real>(tm->getTimeStepSize());
@@ -407,7 +466,11 @@ void TimeStepDFSPHCUDA::step()
 	m_iterationsV = stats.iterationsV;
 
 	// Mirror device state to the host so existing visualization/export works.
-	scatterHostState();
+	{
+		START_TIMING("DFSPH_CUDA_mirror");
+		scatterHostState();
+		STOP_TIMING_AVG;
+	}
 
 	// Adopt the device-computed CFL timestep and advance simulation time by the
 	// dt actually used for integration this step.
@@ -415,6 +478,8 @@ void TimeStepDFSPHCUDA::step()
 	tm->setTimeStepSize(dtUsed);
 	tm->setTime(tm->getTime() + dtUsed);
 
+	START_TIMING("DFSPH_CUDA_epilogue");
 	sim->emitParticles();
 	sim->animateParticles();
+	STOP_TIMING_AVG;
 }

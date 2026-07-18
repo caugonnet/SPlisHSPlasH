@@ -180,6 +180,13 @@ namespace cuda_dfsph
 		// Copy the requested device fields into the caller's host arrays.
 		virtual void copyStateToHost(const HostMirror &mirror) = 0;
 
+		// Pinned (page-locked) host memory for fast D2H mirroring. The facade is
+		// CUDA-free, so allocation goes through the backend. Returns nullptr on
+		// failure; buffers must be released with freeHostPinned before the
+		// backend is destroyed.
+		virtual cudsph_real *allocHostPinned(size_t count) = 0;
+		virtual void freeHostPinned(cudsph_real *p) = 0;
+
 		// Fetch net boundary reactions (valid after step()). Length = numBoundaries.
 		virtual void getBoundaryReactions(BoundaryReaction *out) const = 0;
 

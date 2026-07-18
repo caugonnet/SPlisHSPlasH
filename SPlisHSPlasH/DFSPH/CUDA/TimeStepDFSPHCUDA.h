@@ -31,13 +31,17 @@ namespace SPH
 		bool m_initialized;
 		int m_orchestrator;             // cuda_dfsph::Orchestrator as int (parameter)
 		bool m_runFeatureProbes;
+		bool m_fullMirror;              // mirror solver-internal fields every step (debug)
 
 		// Host staging buffers reused across steps (avoid per-step allocation).
-		std::vector<cuda_dfsph::cudsph_real> m_hPos;
-		std::vector<cuda_dfsph::cudsph_real> m_hVel;
+		// The per-step mirror targets (positions/velocities/density) are pinned
+		// host memory allocated through the backend for fast D2H transfers.
+		cuda_dfsph::cudsph_real *m_hPos;
+		cuda_dfsph::cudsph_real *m_hVel;
+		cuda_dfsph::cudsph_real *m_hDensity;
+		unsigned int m_pinnedCapacity;
 		std::vector<cuda_dfsph::cudsph_real> m_hMass;
 		std::vector<int> m_hState;
-		std::vector<cuda_dfsph::cudsph_real> m_hDensity;
 		std::vector<cuda_dfsph::cudsph_real> m_hFactor;
 		std::vector<cuda_dfsph::cudsph_real> m_hDensityAdv;
 		std::vector<cuda_dfsph::cudsph_real> m_hPressureRho2;
@@ -50,6 +54,7 @@ namespace SPH
 		std::vector<cuda_dfsph::BoundaryMapDesc> m_mapDescs;
 
 		void ensureInitialized();
+		void ensurePinned(unsigned int n);
 		void buildSceneDesc(cuda_dfsph::SceneDesc &scene);
 		void gatherHostState();
 		void scatterHostState();
@@ -63,6 +68,7 @@ namespace SPH
 		static int ENUM_ORCH_STF_GRAPH;
 		static int ENUM_ORCH_STF_COND;
 		static int RUN_FEATURE_PROBES;
+		static int FULL_MIRROR;
 
 		static std::string METHOD_NAME;
 
