@@ -42,16 +42,21 @@ void launchViscosityStandard(const DeviceState &s, CubicKernelC kernel,
 							 real viscosity, real dcoef, real h2, cudaStream_t stream);
 
 // CFL: writes (vel + accel*dt)^2 per active particle into scratch (0 otherwise).
-void launchComputeMaxVelSq(const DeviceState &s, real dt, real *scratch, cudaStream_t stream);
-void launchApplyVelocityUpdate(const DeviceState &s, real dt, cudaStream_t stream);
-void launchApplyPosition(const DeviceState &s, real dt, cudaStream_t stream);
+void launchComputeMaxVelSq(const DeviceState &s, real dt, real *scratch, cudaStream_t stream,
+						   const real *dtPtr = nullptr);
+void launchApplyVelocityUpdate(const DeviceState &s, real dt, cudaStream_t stream,
+							   const real *dtPtr = nullptr);
+void launchApplyPosition(const DeviceState &s, real dt, cudaStream_t stream,
+						 const real *dtPtr = nullptr);
 
 // Solver initialisation (warm start + factor scaling). dt is the timestep the
 // respective solver runs with.
 void launchDivergenceInit(const DeviceState &s, const DeviceBoundaryMap &bmap,
-						  CubicKernelC kernel, real dt, cudaStream_t stream);
+						  CubicKernelC kernel, real dt, cudaStream_t stream,
+						  const real *dtPtr = nullptr);
 void launchPressureInit(const DeviceState &s, const DeviceBoundaryMap &bmap,
-						CubicKernelC kernel, real dt, cudaStream_t stream);
+						CubicKernelC kernel, real dt, cudaStream_t stream,
+						const real *dtPtr = nullptr);
 
 // Pressure accelerations from a given pressure array (p or p_v).
 void launchComputePressureAccel(const DeviceState &s, const DeviceBoundaryMap &bmap,
@@ -63,11 +68,14 @@ void launchComputePressureAccel(const DeviceState &s, const DeviceBoundaryMap &b
 // Writes per-particle (-density0*residuum) into errScratch for reduction.
 void launchSolveIterate(const DeviceState &s, const DeviceBoundaryMap &bmap,
 						CubicKernelC kernel, real *pressure, real hFactor,
-						int isPressure, real eps, real *errScratch, cudaStream_t stream);
+						int isPressure, real eps, real *errScratch, cudaStream_t stream,
+						const real *dtPtr = nullptr);
 
 // Finalisers.
-void launchDivergenceFinalizeApply(const DeviceState &s, real dt, cudaStream_t stream);
-void launchPressureFinalizeApply(const DeviceState &s, real dt, cudaStream_t stream);
+void launchDivergenceFinalizeApply(const DeviceState &s, real dt, cudaStream_t stream,
+								   const real *dtPtr = nullptr);
+void launchPressureFinalizeApply(const DeviceState &s, real dt, cudaStream_t stream,
+								 const real *dtPtr = nullptr);
 
 // Host <-> device staging of interleaved real3 arrays (packing).
 void launchZeroReaction(BodyReactionAccum reaction, cudaStream_t stream);
@@ -77,7 +85,15 @@ void launchZeroReaction(BodyReactionAccum reaction, cudaStream_t stream);
 // writes the loop-continue flag into *cond using the exact host predicate.
 void launchSolverLoopCond(const real *errSum, unsigned int *iter, real *avgOut, int *cond,
 						  real invN, real eta, unsigned int minIter, unsigned int maxIter,
-						  cudaStream_t stream);
+						  cudaStream_t stream, const real *dtPtr = nullptr, int etaOverDt = 0);
+
+// Device-side dt control for the whole-step graph: dt2[0] = base dt of the
+// current step, dt2[1] = dt used for integration. Rotate promotes the previous
+// dtUsed at the start of a relaunch; update applies CFL method 1 (or copies
+// dt2[0] when disabled).
+void launchCflRotateDt(real *dt2, cudaStream_t stream);
+void launchCflUpdateDt(const real *maxVelSq, real *dt2, real cflFactor, real diameter,
+					   real cflMin, real cflMax, int enabled, cudaStream_t stream);
 
 } // namespace cuda_dfsph
 } // namespace SPH

@@ -335,11 +335,20 @@ record-once/relaunch-many is the right pattern.
    Next perf step here: milestone 9 (whole-timestep graph), which subsumes the
    remaining per-step launch/sync overhead — this is where the conditional
    nodes should start paying off visibly.
-3b. ~~Whole-timestep relaunchable graph~~ **done for fixed dt 2026-07-18**
-   (see "Whole-timestep relaunchable graph" above). Remaining extension:
-   device-resident dt (kernels reading dt from device memory) would let the
-   adaptive-CFL path live inside the reusable graph too — needs kernels to take
-   `const real* dt` instead of a baked host scalar.
+3b. ~~Whole-timestep relaunchable graph~~ **done 2026-07-18, including
+   adaptive CFL via device-resident dt** (see "Whole-timestep relaunchable
+   graph" above). dt lives in `m_dDt[2]` on device: `kCflRotateDt` promotes the
+   previous dtUsed to the new base dt at graph start, `kCflUpdateDt` applies
+   CFL method 1 (or copies base dt when disabled) after a CUB max-reduction of
+   predicted velocities. Every dt-consuming kernel takes an optional
+   `const real *dtPtr` override (nullptr = host value; kernels derive 1/dt,
+   1/dt², dt², eta/dt themselves), so the host-loop paths are unchanged.
+   Host-side seeding only when the caller's dt disagrees with the last
+   device dtUsed (first step / external dt change); dtUsed is read back with
+   the per-step stats. Validated bit-identical to Direct stream under both
+   fixed dt and CFL method 1 (identical step counts). 85k + adaptive CFL:
+   whole-graph 3.11 ms vs direct 3.66 ms (**15% faster**), StfStream 3.19,
+   conditional 3.39.
 4. ~~Reduce the per-step host mirror~~ **done 2026-07-18**: SimStep at 85k is
    now ~3.3 ms steady-state (2.35 GPU + 0.95 mirror) vs 40.2 ms CPU ⇒ ~12×
    end-to-end. Remaining ideas: true triple-buffered snapshots for the GUI

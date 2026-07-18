@@ -90,14 +90,19 @@ private:
 	// Records one solver while-loop (counter reset task + conditional node) into
 	// the current scope of sctx. `slot` selects the m_dIter/m_dErrOut entry
 	// (0 = divergence, 1 = pressure) so both loops can coexist in one graph.
+	// When dtPtr is non-null the kernels read dt from device memory (whole-step
+	// graph with device-resident CFL): hFactor is derived per iteration and the
+	// divergence eta (which scales with 1/dt) is divided on device.
 	template <typename Tok>
 	void recordSolverLoop(stf::stackable_ctx &sctx, Tok &tok,
 						  real *pressure, real hFactor, int isPressure,
-						  real eta, unsigned int minIter, unsigned int maxIter, unsigned int slot);
+						  real eta, unsigned int minIter, unsigned int maxIter, unsigned int slot,
+						  const real *dtPtr = nullptr);
 	// The whole timestep as a single pushed CUDA graph (both solver loops as
-	// nested conditional nodes). Requires a fixed dt (cflMethod 0): the adaptive
-	// CFL needs a host readback mid-step, which a fully device-resident graph
-	// cannot express yet.
+	// nested conditional nodes). dt is device-resident (m_dDt): a rotate kernel
+	// promotes the previous dtUsed at graph start and a device CFL kernel
+	// computes the integration dt, so the same recorded graph is valid across
+	// steps even under adaptive CFL.
 	void runTimestepGraph(const StepDesc &sd, StepStats &stats, cudaStream_t stream);
 
 	DeviceState m_s;
@@ -132,18 +137,20 @@ private:
 	real *m_hReduce = nullptr;   // pinned host scalar
 	unsigned int *m_dIter = nullptr; // device iteration counters for while-graph loops [2]: 0=divergence, 1=pressure
 	real *m_dErrOut = nullptr;       // final avg density error per while-graph loop [2]
+	real *m_dDt = nullptr;           // device-resident dt [2]: 0=base dt of the step, 1=dt used for integration
+	real m_lastDtUsed = -1;          // host copy of m_dDt[1] after the last graph step (seed check)
 
 	// Persistent CUDASTF context for the conditional while-graph solver loops.
 	// Kept alive across timesteps so the executable-graph cache turns per-step
 	// child-graph instantiation into a cheap cudaGraphExecUpdate.
 	std::unique_ptr<stf::stackable_ctx> m_whileCtx;
 
-	// Whole-timestep graph (StfGraph + fixed dt): recorded once, relaunched
-	// every step. Lives in its own context because push() is forbidden while a
-	// pop-epilogue is pending (the launchable_graph holds the pop open).
+	// Whole-timestep graph (StfGraph): recorded once, relaunched every step
+	// (dt is device-resident, so adaptive CFL relaunches too). Lives in its own
+	// context because push() is forbidden while a pop-epilogue is pending (the
+	// launchable_graph holds the pop open).
 	std::unique_ptr<stf::stackable_ctx> m_graphCtx;
 	stf::stackable_ctx::launchable_graph m_stepGraph;
-	real m_graphDt = -1;                 // dt the step graph was recorded with
 	real m_graphGrav[3] = {0, 0, 0};     // gravity baked into the step graph
 	BodyReactionAccum m_reaction{};
 	double *m_hReaction = nullptr; // pinned host [6]
@@ -297,6 +304,9 @@ void DFSPHCudaBackendImpl::initialize(const SceneDesc &scene)
 	m_dErrOut = devAlloc<real>(2);
 	cudaCheck(cudaMemset(m_dIter, 0, 2 * sizeof(unsigned int)), "clear iter");
 	cudaCheck(cudaMemset(m_dErrOut, 0, 2 * sizeof(real)), "clear errout");
+	m_dDt = devAlloc<real>(2);
+	cudaCheck(cudaMemset(m_dDt, 0, 2 * sizeof(real)), "clear dt");
+	m_lastDtUsed = -1;
 	m_reaction.force = devAlloc<double>(3);
 	m_reaction.torque = devAlloc<double>(3);
 	cudaCheck(cudaMallocHost(&m_hReaction, 6 * sizeof(double)), "pinned reaction");
@@ -358,8 +368,10 @@ struct LoopCondNonZero
 template <typename Tok>
 void DFSPHCudaBackendImpl::recordSolverLoop(stf::stackable_ctx &sctx, Tok &tok,
 											real *pressure, real hFactor, int isPressure,
-											real eta, unsigned int minIter, unsigned int maxIter, unsigned int slot)
+											real eta, unsigned int minIter, unsigned int maxIter, unsigned int slot,
+											const real *dtPtr)
 {
+	const int etaOverDt = (dtPtr != nullptr && !isPressure) ? 1 : 0;
 	const real invN = static_cast<real>(1.0) / static_cast<real>(m_s.n);
 	unsigned int *dIter = m_dIter + slot;
 	real *dAvg = m_dErrOut + slot;
@@ -380,10 +392,10 @@ void DFSPHCudaBackendImpl::recordSolverLoop(stf::stackable_ctx &sctx, Tok &tok,
 		// loop-continue flag orders update_cond after the body.
 		sctx.task(tok.rw(), tokIter.rw(), lCond.write())->*[=](cudaStream_t s, auto cond) {
 			launchComputePressureAccel(m_s, m_map0, m_kernel, pressure, m_eps, 0, m_reaction, s);
-			launchSolveIterate(m_s, m_map0, m_kernel, pressure, hFactor, isPressure, m_eps, m_errScratch, s);
+			launchSolveIterate(m_s, m_map0, m_kernel, pressure, hFactor, isPressure, m_eps, m_errScratch, s, dtPtr);
 			size_t bytes = m_cubTempBytes;
 			cub::DeviceReduce::Sum(m_cubTemp, bytes, m_errScratch, m_dReduce, static_cast<int>(m_s.n), s);
-			launchSolverLoopCond(m_dReduce, dIter, dAvg, cond.addr, invN, eta, minIter, maxIter, s);
+			launchSolverLoopCond(m_dReduce, dIter, dAvg, cond.addr, invN, eta, minIter, maxIter, s, dtPtr, etaOverDt);
 		};
 		wg.update_cond(lCond.read())->*LoopCondNonZero{};
 	}
@@ -440,12 +452,23 @@ void DFSPHCudaBackendImpl::runTimestepGraph(const StepDesc &sd, StepStats &stats
 		m_graphCtx = std::make_unique<stf::stackable_ctx>();
 	stf::stackable_ctx &sctx = *m_graphCtx;
 
-	// The recorded graph is only a function of dt, gravity and the boundary
-	// transforms (all pointers, counts and solver parameters are fixed after
-	// initialize()). Rebuild when any of these change; otherwise relaunch the
-	// stored executable graph. Moving bodies bake a new m_map0 into the kernel
-	// arguments, so they force a rebuild every step for now.
-	const bool rebuild = !m_stepGraph.valid() || m_graphDt != dt0
+	// Seed the device-resident dt when the caller's dt does not match the last
+	// device-computed dtUsed (first step, or the user changed dt externally).
+	// Otherwise the in-graph rotate kernel promotes dtUsed -> base dt.
+	if (dt0 != m_lastDtUsed)
+	{
+		const real seed[2] = {dt0, dt0};
+		cudaCheck(cudaMemcpy(m_dDt, seed, sizeof(seed), cudaMemcpyHostToDevice), "dt seed");
+		m_lastDtUsed = dt0;
+	}
+
+	// The recorded graph is only a function of gravity and the boundary
+	// transforms (dt lives in device memory; all pointers, counts and solver
+	// parameters are fixed after initialize()). Rebuild when any of these
+	// change; otherwise relaunch the stored executable graph. Moving bodies
+	// bake a new m_map0 into the kernel arguments, so they force a rebuild
+	// every step for now.
+	const bool rebuild = !m_stepGraph.valid()
 		|| m_graphGrav[0] != gravity.x || m_graphGrav[1] != gravity.y || m_graphGrav[2] != gravity.z
 		|| sd.bodyRotation != nullptr;
 	if (rebuild)
@@ -457,6 +480,10 @@ void DFSPHCudaBackendImpl::runTimestepGraph(const StepDesc &sd, StepStats &stats
 		auto tok = sctx.token();
 		auto tokBoundary = sctx.token();
 
+		// 0. Promote the previous step's dtUsed to this step's base dt.
+		sctx.task(tok.rw())->*[=](cudaStream_t s) {
+			launchCflRotateDt(m_dDt, s);
+		};
 		// 1. Neighborhood build. neighborhood() re-points m_s.cellKey/sortedId on
 		// the host during recording, so later lambdas (which read m_s through
 		// `this` when they are recorded) see the sorted buffers.
@@ -478,43 +505,51 @@ void DFSPHCudaBackendImpl::runTimestepGraph(const StepDesc &sd, StepStats &stats
 		// 5. Divergence solve (uses dt0).
 		if (m_enableDivergence)
 		{
-			const real etaV = (static_cast<real>(1.0) / dt0) * m_maxErrorV * static_cast<real>(0.01) * m_s.density0;
+			// etaV scales with 1/dt: pass the dt-independent base, the loop-cond
+			// kernel divides by the device dt each iteration.
+			const real etaVBase = m_maxErrorV * static_cast<real>(0.01) * m_s.density0;
 			sctx.task(tok.rw())->*[=](cudaStream_t s) {
-				launchDivergenceInit(m_s, m_map0, m_kernel, dt0, s);
+				launchDivergenceInit(m_s, m_map0, m_kernel, dt0, s, m_dDt + 0);
 			};
-			recordSolverLoop(sctx, tok, m_s.pressureRho2V, dt0, 0, etaV, 1, m_maxIterationsV, 0);
+			recordSolverLoop(sctx, tok, m_s.pressureRho2V, dt0, 0, etaVBase, 1, m_maxIterationsV, 0, m_dDt + 0);
 			sctx.task(tok.rw())->*[=](cudaStream_t s) {
 				launchZeroReaction(m_reaction, s);
 				launchComputePressureAccel(m_s, m_map0, m_kernel, m_s.pressureRho2V, m_eps, 1, m_reaction, s);
-				launchDivergenceFinalizeApply(m_s, dt0, s);
+				launchDivergenceFinalizeApply(m_s, dt0, s, m_dDt + 0);
 			};
 		}
 
-		// 6-9. Forces, velocity update, pressure init (fixed dt: dtUsed == dt0).
+		// 6-9. Forces, device-side CFL, velocity update, pressure init.
 		sctx.task(tok.rw())->*[=](cudaStream_t s) {
 			launchClearAccelGravity(m_s, gravity, s);
 			if (m_viscosity > 0)
 				launchViscosityStandard(m_s, m_kernel, m_viscosity, m_viscDCoef, m_h2support, s);
-			launchApplyVelocityUpdate(m_s, dt0, s);
-			launchPressureInit(m_s, m_map0, m_kernel, dt0, s);
+			// CFL (method 1) on device: predicted max velocity with the base dt,
+			// then clamp into m_dDt[1]. cflMethod 0 copies the base dt instead.
+			launchComputeMaxVelSq(m_s, dt0, m_errScratch, s, m_dDt + 0);
+			size_t bytes = m_cubTempBytes;
+			cub::DeviceReduce::Max(m_cubTemp, bytes, m_errScratch, m_dReduce, static_cast<int>(m_s.n), s);
+			launchCflUpdateDt(m_dReduce, m_dDt, m_cflFactor, static_cast<real>(2.0) * m_s.particleRadius,
+							  m_cflMin, m_cflMax, (m_cflMethod != 0) ? 1 : 0, s);
+			launchApplyVelocityUpdate(m_s, dt0, s, m_dDt + 1);
+			launchPressureInit(m_s, m_map0, m_kernel, dt0, s, m_dDt + 1);
 		};
 
-		// 10. Pressure solve.
+		// 10. Pressure solve (eta is dt-independent).
 		const real eta = m_maxError * static_cast<real>(0.01) * m_s.density0;
-		recordSolverLoop(sctx, tok, m_s.pressureRho2, dt0 * dt0, 1, eta, m_minIterations, m_maxIterations, 1);
+		recordSolverLoop(sctx, tok, m_s.pressureRho2, dt0 * dt0, 1, eta, m_minIterations, m_maxIterations, 1, m_dDt + 1);
 
 		// 11. Finalize, integrate positions, fetch reaction totals.
 		sctx.task(tok.rw())->*[=](cudaStream_t s) {
 			launchZeroReaction(m_reaction, s);
 			launchComputePressureAccel(m_s, m_map0, m_kernel, m_s.pressureRho2, m_eps, 1, m_reaction, s);
-			launchPressureFinalizeApply(m_s, dt0, s);
-			launchApplyPosition(m_s, dt0, s);
+			launchPressureFinalizeApply(m_s, dt0, s, m_dDt + 1);
+			launchApplyPosition(m_s, dt0, s, m_dDt + 1);
 			cudaMemcpyAsync(m_hReaction, m_reaction.force, 3 * sizeof(double), cudaMemcpyDeviceToHost, s);
 			cudaMemcpyAsync(m_hReaction + 3, m_reaction.torque, 3 * sizeof(double), cudaMemcpyDeviceToHost, s);
 		};
 
 		m_stepGraph = sctx.pop_prologue_shared();
-		m_graphDt = dt0;
 		m_graphGrav[0] = gravity.x; m_graphGrav[1] = gravity.y; m_graphGrav[2] = gravity.z;
 		stats.graphBuilds++;
 
@@ -532,14 +567,17 @@ void DFSPHCudaBackendImpl::runTimestepGraph(const StepDesc &sd, StepStats &stats
 
 	unsigned int iters[2] = {0, 0};
 	real avgs[2] = {0, 0};
+	real dts[2] = {dt0, dt0};
 	cudaCheck(cudaMemcpy(iters, m_dIter, 2 * sizeof(unsigned int), cudaMemcpyDeviceToHost), "iters D2H");
 	cudaCheck(cudaMemcpy(avgs, m_dErrOut, 2 * sizeof(real), cudaMemcpyDeviceToHost), "errs D2H");
+	cudaCheck(cudaMemcpy(dts, m_dDt, 2 * sizeof(real), cudaMemcpyDeviceToHost), "dt D2H");
 	stats.iterationsV = m_enableDivergence ? iters[0] : 0;
 	stats.iterations = iters[1];
 	stats.avgDensityErrV = m_enableDivergence ? avgs[0] : 0;
 	stats.avgDensityErr = avgs[1];
-	m_suggestedDt = dt0;
-	stats.dtUsed = dt0;
+	m_suggestedDt = dts[1];
+	stats.dtUsed = dts[1];
+	m_lastDtUsed = dts[1];
 }
 
 void DFSPHCudaBackendImpl::runTimestep(const StepDesc &sd, StepStats &stats, cudaStream_t stream, bool /*useStf*/)
@@ -679,10 +717,9 @@ void DFSPHCudaBackendImpl::step(const StepDesc &sd, StepStats &stats)
 	cudaCheck(cudaEventCreate(&t0), "event");
 	cudaCheck(cudaEventCreate(&t1), "event");
 
-	// StfGraph with a fixed timestep runs the whole step as one CUDA graph with
-	// nested conditional while nodes. With adaptive CFL it falls back to the
-	// StfStream behavior below (the CFL readback splits the step on the host).
-	const bool wholeStepGraph = (sd.orchestrator == Orchestrator::StfGraph && m_cflMethod == 0);
+	// StfGraph runs the whole step as one CUDA graph with nested conditional
+	// while nodes; dt (including adaptive CFL) is device-resident.
+	const bool wholeStepGraph = (sd.orchestrator == Orchestrator::StfGraph);
 
 	if (sd.orchestrator == Orchestrator::DirectStream || sd.orchestrator == Orchestrator::StfConditional || wholeStepGraph)
 	{
@@ -778,7 +815,6 @@ void DFSPHCudaBackendImpl::destroy()
 		m_graphCtx->finalize();
 		m_graphCtx.reset();
 	}
-	m_graphDt = -1;
 	if (m_whileCtx)
 	{
 		m_whileCtx->finalize();
@@ -790,7 +826,7 @@ void DFSPHCudaBackendImpl::destroy()
 	cudaFree(m_s.boundaryVolume); cudaFree(m_s.boundaryXj);
 	cudaFree(m_baseKey); cudaFree(m_baseId); cudaFree(m_s.cellStart); cudaFree(m_s.cellEnd);
 	cudaFree(m_keysAlt); cudaFree(m_valsAlt); cudaFree(m_errScratch);
-	cudaFree(m_cubTemp); cudaFree(m_dReduce); cudaFree(m_dIter); cudaFree(m_dErrOut);
+	cudaFree(m_cubTemp); cudaFree(m_dReduce); cudaFree(m_dIter); cudaFree(m_dErrOut); cudaFree(m_dDt);
 	if (m_hReduce) cudaFreeHost(m_hReduce);
 	cudaFree(m_reaction.force); cudaFree(m_reaction.torque);
 	if (m_hReaction) cudaFreeHost(m_hReaction);
@@ -801,6 +837,7 @@ void DFSPHCudaBackendImpl::destroy()
 	m_errScratch = m_dReduce = nullptr;
 	m_dIter = nullptr;
 	m_dErrOut = nullptr;
+	m_dDt = nullptr;
 	m_hReduce = nullptr;
 	m_cubTemp = nullptr;
 	m_hReaction = nullptr;

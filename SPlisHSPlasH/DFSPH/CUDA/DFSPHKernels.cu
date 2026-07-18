@@ -290,44 +290,47 @@ void launchViscosityStandard(const DeviceState &s, CubicKernelC kernel, real vis
 	kViscosityStandard<<<gridBlocks(s.n), kBlock, 0, stream>>>(s, kernel, viscosity, dcoef, h2);
 }
 
-__global__ void kComputeMaxVelSq(DeviceState s, real dt, real *scratch)
+__global__ void kComputeMaxVelSq(DeviceState s, real dt, const real *dtPtr, real *scratch)
 {
 	unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
 	if (i >= s.n) return;
+	if (dtPtr) dt = *dtPtr;
 	if (s.state[i] != 0) { scratch[i] = 0; return; }
 	real3 predicted = s.vel[i] + dt * s.accel[i];
 	scratch[i] = sqnorm(predicted);
 }
 
-void launchComputeMaxVelSq(const DeviceState &s, real dt, real *scratch, cudaStream_t stream)
+void launchComputeMaxVelSq(const DeviceState &s, real dt, real *scratch, cudaStream_t stream, const real *dtPtr)
 {
-	kComputeMaxVelSq<<<gridBlocks(s.n), kBlock, 0, stream>>>(s, dt, scratch);
+	kComputeMaxVelSq<<<gridBlocks(s.n), kBlock, 0, stream>>>(s, dt, dtPtr, scratch);
 }
 
-__global__ void kApplyVelocityUpdate(DeviceState s, real dt)
+__global__ void kApplyVelocityUpdate(DeviceState s, real dt, const real *dtPtr)
 {
 	unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
 	if (i >= s.n) return;
+	if (dtPtr) dt = *dtPtr;
 	if (s.state[i] != 0) return;
 	s.vel[i] += dt * s.accel[i];
 }
 
-void launchApplyVelocityUpdate(const DeviceState &s, real dt, cudaStream_t stream)
+void launchApplyVelocityUpdate(const DeviceState &s, real dt, cudaStream_t stream, const real *dtPtr)
 {
-	kApplyVelocityUpdate<<<gridBlocks(s.n), kBlock, 0, stream>>>(s, dt);
+	kApplyVelocityUpdate<<<gridBlocks(s.n), kBlock, 0, stream>>>(s, dt, dtPtr);
 }
 
-__global__ void kApplyPosition(DeviceState s, real dt)
+__global__ void kApplyPosition(DeviceState s, real dt, const real *dtPtr)
 {
 	unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
 	if (i >= s.n) return;
+	if (dtPtr) dt = *dtPtr;
 	if (s.state[i] != 0) return;
 	s.pos[i] += dt * s.vel[i];
 }
 
-void launchApplyPosition(const DeviceState &s, real dt, cudaStream_t stream)
+void launchApplyPosition(const DeviceState &s, real dt, cudaStream_t stream, const real *dtPtr)
 {
-	kApplyPosition<<<gridBlocks(s.n), kBlock, 0, stream>>>(s, dt);
+	kApplyPosition<<<gridBlocks(s.n), kBlock, 0, stream>>>(s, dt, dtPtr);
 }
 
 // ---------------------------------------------------------------------------
@@ -357,10 +360,11 @@ __device__ __forceinline__ unsigned int deviceCountFluidNeighbors(const DeviceSt
 // ---------------------------------------------------------------------------
 // Solver initialisation
 // ---------------------------------------------------------------------------
-__global__ void kDivergenceInit(DeviceState s, DeviceBoundaryMap m, CubicKernelC ker, real invH, int is2D)
+__global__ void kDivergenceInit(DeviceState s, DeviceBoundaryMap m, CubicKernelC ker, real invH, int is2D, const real *dtPtr)
 {
 	unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
 	if (i >= s.n) return;
+	if (dtPtr) invH = static_cast<real>(1.0) / *dtPtr;
 
 	const real3 xi = s.pos[i];
 	const real3 vi = s.vel[i];
@@ -388,16 +392,17 @@ __global__ void kDivergenceInit(DeviceState s, DeviceBoundaryMap m, CubicKernelC
 		s.pressureRho2V[i] = 0;
 }
 
-void launchDivergenceInit(const DeviceState &s, const DeviceBoundaryMap &bmap, CubicKernelC kernel, real dt, cudaStream_t stream)
+void launchDivergenceInit(const DeviceState &s, const DeviceBoundaryMap &bmap, CubicKernelC kernel, real dt, cudaStream_t stream, const real *dtPtr)
 {
 	const real invH = static_cast<real>(1.0) / dt;
-	kDivergenceInit<<<gridBlocks(s.n), kBlock, 0, stream>>>(s, bmap, kernel, invH, s.sim2D);
+	kDivergenceInit<<<gridBlocks(s.n), kBlock, 0, stream>>>(s, bmap, kernel, invH, s.sim2D, dtPtr);
 }
 
-__global__ void kPressureInit(DeviceState s, DeviceBoundaryMap m, CubicKernelC ker, real invH2, real h)
+__global__ void kPressureInit(DeviceState s, DeviceBoundaryMap m, CubicKernelC ker, real invH2, real h, const real *dtPtr)
 {
 	unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
 	if (i >= s.n) return;
+	if (dtPtr) { h = *dtPtr; invH2 = static_cast<real>(1.0) / (h * h); }
 
 	const real3 xi = s.pos[i];
 	const real3 vi = s.vel[i];
@@ -426,10 +431,10 @@ __global__ void kPressureInit(DeviceState s, DeviceBoundaryMap m, CubicKernelC k
 		s.pressureRho2[i] = 0;
 }
 
-void launchPressureInit(const DeviceState &s, const DeviceBoundaryMap &bmap, CubicKernelC kernel, real dt, cudaStream_t stream)
+void launchPressureInit(const DeviceState &s, const DeviceBoundaryMap &bmap, CubicKernelC kernel, real dt, cudaStream_t stream, const real *dtPtr)
 {
 	const real invH2 = static_cast<real>(1.0) / (dt * dt);
-	kPressureInit<<<gridBlocks(s.n), kBlock, 0, stream>>>(s, bmap, kernel, invH2, dt);
+	kPressureInit<<<gridBlocks(s.n), kBlock, 0, stream>>>(s, bmap, kernel, invH2, dt, dtPtr);
 }
 
 // ---------------------------------------------------------------------------
@@ -512,10 +517,12 @@ __device__ __forceinline__ real deviceAijPj(const DeviceState &s, CubicKernelC k
 }
 
 __global__ void kSolveIterate(DeviceState s, DeviceBoundaryMap m, CubicKernelC ker, real *pressure,
-							  real hFactor, int isPressure, int is2D, real density0, real *errScratch)
+							  real hFactor, int isPressure, int is2D, real density0, real *errScratch,
+							  const real *dtPtr)
 {
 	unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
 	if (i >= s.n) return;
+	if (dtPtr) hFactor = isPressure ? (*dtPtr) * (*dtPtr) : *dtPtr;
 
 	if (isPressure && s.state[i] != 0)
 	{
@@ -544,39 +551,42 @@ __global__ void kSolveIterate(DeviceState s, DeviceBoundaryMap m, CubicKernelC k
 }
 
 void launchSolveIterate(const DeviceState &s, const DeviceBoundaryMap &bmap, CubicKernelC kernel, real *pressure,
-						real hFactor, int isPressure, real, real *errScratch, cudaStream_t stream)
+						real hFactor, int isPressure, real, real *errScratch, cudaStream_t stream,
+						const real *dtPtr)
 {
-	kSolveIterate<<<gridBlocks(s.n), kBlock, 0, stream>>>(s, bmap, kernel, pressure, hFactor, isPressure, s.sim2D, s.density0, errScratch);
+	kSolveIterate<<<gridBlocks(s.n), kBlock, 0, stream>>>(s, bmap, kernel, pressure, hFactor, isPressure, s.sim2D, s.density0, errScratch, dtPtr);
 }
 
 // ---------------------------------------------------------------------------
 // Finalisers
 // ---------------------------------------------------------------------------
-__global__ void kDivergenceFinalizeApply(DeviceState s, real dt)
+__global__ void kDivergenceFinalizeApply(DeviceState s, real dt, const real *dtPtr)
 {
 	unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
 	if (i >= s.n) return;
+	if (dtPtr) dt = *dtPtr;
 	s.vel[i] += dt * s.pressureAccel[i];
 	s.factor[i] *= dt;
 	s.pressureRho2V[i] *= dt; // warm start persistence (USE_WARMSTART_V)
 }
 
-void launchDivergenceFinalizeApply(const DeviceState &s, real dt, cudaStream_t stream)
+void launchDivergenceFinalizeApply(const DeviceState &s, real dt, cudaStream_t stream, const real *dtPtr)
 {
-	kDivergenceFinalizeApply<<<gridBlocks(s.n), kBlock, 0, stream>>>(s, dt);
+	kDivergenceFinalizeApply<<<gridBlocks(s.n), kBlock, 0, stream>>>(s, dt, dtPtr);
 }
 
-__global__ void kPressureFinalizeApply(DeviceState s, real dt)
+__global__ void kPressureFinalizeApply(DeviceState s, real dt, const real *dtPtr)
 {
 	unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
 	if (i >= s.n) return;
+	if (dtPtr) dt = *dtPtr;
 	s.vel[i] += dt * s.pressureAccel[i];
 	s.pressureRho2[i] *= dt * dt; // warm start persistence (USE_WARMSTART)
 }
 
-void launchPressureFinalizeApply(const DeviceState &s, real dt, cudaStream_t stream)
+void launchPressureFinalizeApply(const DeviceState &s, real dt, cudaStream_t stream, const real *dtPtr)
 {
-	kPressureFinalizeApply<<<gridBlocks(s.n), kBlock, 0, stream>>>(s, dt);
+	kPressureFinalizeApply<<<gridBlocks(s.n), kBlock, 0, stream>>>(s, dt, dtPtr);
 }
 
 __global__ void kZeroReaction(BodyReactionAccum r)
@@ -596,10 +606,12 @@ void launchZeroReaction(BodyReactionAccum reaction, cudaStream_t stream)
 // `while ((!chk || iters < minIter) && iters < maxIter)` with chk = (avg <= eta).
 // Runs once per while-graph iteration, after the CUB error reduction.
 __global__ void kSolverLoopCond(const real *errSum, unsigned int *iter, real *avgOut, int *cond,
-								real invN, real eta, unsigned int minIter, unsigned int maxIter)
+								real invN, real eta, unsigned int minIter, unsigned int maxIter,
+								const real *dtPtr, int etaOverDt)
 {
 	const unsigned int it = *iter + 1;
 	*iter = it;
+	if (dtPtr && etaOverDt) eta = eta / *dtPtr;
 	const real avg = (*errSum) * invN;
 	*avgOut = avg;
 	const bool chk = (avg <= eta);
@@ -608,9 +620,45 @@ __global__ void kSolverLoopCond(const real *errSum, unsigned int *iter, real *av
 
 void launchSolverLoopCond(const real *errSum, unsigned int *iter, real *avgOut, int *cond,
 						  real invN, real eta, unsigned int minIter, unsigned int maxIter,
-						  cudaStream_t stream)
+						  cudaStream_t stream, const real *dtPtr, int etaOverDt)
 {
-	kSolverLoopCond<<<1, 1, 0, stream>>>(errSum, iter, avgOut, cond, invN, eta, minIter, maxIter);
+	kSolverLoopCond<<<1, 1, 0, stream>>>(errSum, iter, avgOut, cond, invN, eta, minIter, maxIter, dtPtr, etaOverDt);
+}
+
+// Device-side CFL control for the whole-step graph. dt2[0] = this step's base
+// dt, dt2[1] = dt used for integration (CFL method 1, or a copy of dt2[0] when
+// CFL is disabled). kCflRotateDt promotes the previous step's dtUsed to the new
+// base dt at the start of each relaunch.
+__global__ void kCflRotateDt(real *dt2)
+{
+	dt2[0] = dt2[1];
+}
+
+__global__ void kCflUpdateDt(const real *maxVelSq, real *dt2, real cflFactor, real diameter,
+							 real cflMin, real cflMax, int enabled)
+{
+	if (!enabled)
+	{
+		dt2[1] = dt2[0];
+		return;
+	}
+	real mv = *maxVelSq;
+	if (mv < static_cast<real>(1.0e-9)) mv = static_cast<real>(1.0e-9);
+	real h = cflFactor * static_cast<real>(0.4) * (diameter / sqrt(mv));
+	if (h > cflMax) h = cflMax;
+	if (h < cflMin) h = cflMin;
+	dt2[1] = h;
+}
+
+void launchCflRotateDt(real *dt2, cudaStream_t stream)
+{
+	kCflRotateDt<<<1, 1, 0, stream>>>(dt2);
+}
+
+void launchCflUpdateDt(const real *maxVelSq, real *dt2, real cflFactor, real diameter,
+					   real cflMin, real cflMax, int enabled, cudaStream_t stream)
+{
+	kCflUpdateDt<<<1, 1, 0, stream>>>(maxVelSq, dt2, cflFactor, diameter, cflMin, cflMax, enabled);
 }
 
 } // namespace cuda_dfsph
