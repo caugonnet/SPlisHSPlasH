@@ -36,6 +36,11 @@ namespace SPH
 		static void renderFluid(FluidModel *model, float *fluidColor, 
 			const unsigned int colorMapType, const bool useScalarField, const std::vector<float>& scalarField,
 			const Real renderMinValue, const Real renderMaxValue);
+		/** Render fluid from GPU-filled VBOs (CUDA/GL interop path). */
+		static void renderFluidVbo(SPH::FluidModel *model, float *fluidColor,
+			const unsigned int colorMapType, const unsigned int posVbo, const unsigned int scalarVbo,
+			const Real renderMinValue, const Real renderMaxValue);
+
 		static void renderSelectedParticles(FluidModel *model, const std::vector<std::vector<unsigned int>>& selectedParticles,
 			const unsigned int colorMapType, 
 			const Real renderMinValue, const Real renderMaxValue);

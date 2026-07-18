@@ -187,6 +187,14 @@ namespace cuda_dfsph
 		virtual cudsph_real *allocHostPinned(size_t count) = 0;
 		virtual void freeHostPinned(cudsph_real *p) = 0;
 
+		// CUDA/OpenGL interop: fill the given VBOs directly from device state
+		// (positions: 3 floats/particle; scalar: velocity magnitude). Buffers are
+		// registered lazily and re-registered when the ids change; must be called
+		// from the thread owning the GL context, after step(). Returns false when
+		// interop is unavailable (no GL context, registration failure) so the
+		// caller can fall back to host-side rendering.
+		virtual bool fillGlRenderBuffers(unsigned int posVbo, unsigned int scalarVbo) = 0;
+
 		// Fetch net boundary reactions (valid after step()). Length = numBoundaries.
 		virtual void getBoundaryReactions(BoundaryReaction *out) const = 0;
 

@@ -106,6 +106,13 @@ void TimeStepDFSPHCUDA::initParameters()
 	setDescription(FULL_MIRROR, "Copy the solver-internal fields (factor, advected density, pressures, pressure accel) to the host every step in addition to position/velocity/density. Needed only for debugging or when exporting those fields.");
 }
 
+bool TimeStepDFSPHCUDA::fillGlRenderBuffers(unsigned int posVbo, unsigned int scalarVbo)
+{
+	if (!m_deviceReady || !m_initialized || m_backend == nullptr)
+		return false;
+	return m_backend->fillGlRenderBuffers(posVbo, scalarVbo);
+}
+
 void TimeStepDFSPHCUDA::reset()
 {
 	TimeStepDFSPH::reset();

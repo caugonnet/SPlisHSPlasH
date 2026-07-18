@@ -92,6 +92,11 @@ namespace SPH
 		virtual void initParameters();
 
 		bool deviceReady() const { return m_deviceReady; }
+
+		// CUDA/OpenGL interop for the GUI: fill the given VBOs (positions +
+		// velocity-magnitude scalar) directly from device state. Returns false
+		// when the backend is not active so callers fall back to host rendering.
+		bool fillGlRenderBuffers(unsigned int posVbo, unsigned int scalarVbo);
 	};
 }
 

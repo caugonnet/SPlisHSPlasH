@@ -41,6 +41,13 @@ target_include_directories(SPlisHSPlasH_CUDA PRIVATE
 	${CCCL_DIR}/cudax/include
 )
 
+# OpenGL headers for the CUDA/GL interop render path (cuda_gl_interop.h needs
+# GL/gl.h; the symbols themselves live in cudart / the exe's GL link).
+find_package(OpenGL QUIET)
+if (OPENGL_INCLUDE_DIR)
+	target_include_directories(SPlisHSPlasH_CUDA PRIVATE ${OPENGL_INCLUDE_DIR})
+endif()
+
 target_compile_options(SPlisHSPlasH_CUDA PRIVATE
 	$<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
 	$<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda>

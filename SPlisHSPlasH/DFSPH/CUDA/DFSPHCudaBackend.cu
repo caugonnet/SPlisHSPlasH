@@ -17,6 +17,9 @@
 #include <cub/device/device_reduce.cuh>
 #include <cuda/experimental/stf.cuh>
 
+#include <GL/gl.h>
+#include <cuda_gl_interop.h>
+
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -68,6 +71,7 @@ public:
 	{
 		if (p) cudaFreeHost(p);
 	}
+	bool fillGlRenderBuffers(unsigned int posVbo, unsigned int scalarVbo) override;
 	void getBoundaryReactions(BoundaryReaction *out) const override;
 	cudsph_real suggestedTimeStep() const override { return m_suggestedDt; }
 
@@ -146,6 +150,17 @@ private:
 	// Kept alive across timesteps so the executable-graph cache turns per-step
 	// child-graph instantiation into a cheap cudaGraphExecUpdate.
 	std::unique_ptr<stf::stackable_ctx> m_whileCtx;
+
+	// CUDA/OpenGL interop state (render buffers registered lazily). When the GL
+	// context lives on a different GPU than the solver (e.g. display on a second
+	// card), the packed buffers are peer-copied into the mapped VBOs.
+	unsigned int m_glPosVbo = 0, m_glScalarVbo = 0;
+	cudaGraphicsResource_t m_glPosRes = nullptr, m_glScalarRes = nullptr;
+	bool m_glFailed = false;   // registration failed once: stop retrying
+	int m_solverDevice = 0;
+	int m_glDevice = -1;       // CUDA device owning the GL context (-1 = unknown)
+	real *m_glStagePos = nullptr;    // solver-device staging (cross-device path)
+	real *m_glStageScalar = nullptr;
 
 	// Whole-timestep graph (StfGraph): recorded once, relaunched every step
 	// (dt is device-resident, so adaptive CFL relaunches too). Lives in its own
@@ -810,6 +825,107 @@ void DFSPHCudaBackendImpl::copyStateToHost(const HostMirror &mirror)
 	cudaCheck(cudaStreamSynchronize(nullptr), "state D2H sync");
 }
 
+bool DFSPHCudaBackendImpl::fillGlRenderBuffers(unsigned int posVbo, unsigned int scalarVbo)
+{
+	if (!m_ready || m_glFailed || posVbo == 0 || scalarVbo == 0)
+		return false;
+
+	// (Re-)register when the buffer ids change. Registration failures are
+	// remembered so a GL-less context does not retry every frame.
+	if (posVbo != m_glPosVbo || scalarVbo != m_glScalarVbo)
+	{
+		// Which CUDA device owns the GL context? With the display on a second
+		// GPU, registration must happen in that device's context and the packed
+		// data is peer-copied across.
+		cudaGetDevice(&m_solverDevice);
+		unsigned int glDevCount = 0;
+		int glDevs[4] = {m_solverDevice, 0, 0, 0};
+		cudaError_t glq = cudaGLGetDevices(&glDevCount, glDevs, 4, cudaGLDeviceListAll);
+		if (glq != cudaSuccess || glDevCount == 0)
+		{
+			// The GL context's GPU is not a visible CUDA device (e.g. display on a
+			// second card hidden by CUDA_VISIBLE_DEVICES): interop cannot work.
+			std::fprintf(stderr, "[dfsph-cuda] GL context has no visible CUDA device (%s); host-side rendering is used.\n",
+						 cudaGetErrorString(glq));
+			cudaGetLastError(); // clear the sticky error
+			m_glFailed = true;
+			return false;
+		}
+		m_glDevice = glDevs[0];
+
+		if (m_glPosRes) { cudaGraphicsUnregisterResource(m_glPosRes); m_glPosRes = nullptr; }
+		if (m_glScalarRes) { cudaGraphicsUnregisterResource(m_glScalarRes); m_glScalarRes = nullptr; }
+
+		cudaSetDevice(m_glDevice);
+		const bool regOk =
+			cudaGraphicsGLRegisterBuffer(&m_glPosRes, posVbo, cudaGraphicsRegisterFlagsWriteDiscard) == cudaSuccess &&
+			cudaGraphicsGLRegisterBuffer(&m_glScalarRes, scalarVbo, cudaGraphicsRegisterFlagsWriteDiscard) == cudaSuccess;
+		cudaSetDevice(m_solverDevice);
+		if (!regOk)
+		{
+			std::fprintf(stderr, "[dfsph-cuda] GL interop registration failed (GL device %d, solver device %d); falling back to host rendering.\n",
+						 m_glDevice, m_solverDevice);
+			if (m_glPosRes) { cudaGraphicsUnregisterResource(m_glPosRes); m_glPosRes = nullptr; }
+			m_glFailed = true;
+			return false;
+		}
+		if (m_glDevice != m_solverDevice)
+		{
+			if (!m_glStagePos) m_glStagePos = devAlloc<real>(3 * m_s.capacity);
+			if (!m_glStageScalar) m_glStageScalar = devAlloc<real>(m_s.capacity);
+			std::fprintf(stderr, "[dfsph-cuda] GL context on device %d, solver on %d: using peer-copy interop path.\n",
+						 m_glDevice, m_solverDevice);
+		}
+		m_glPosVbo = posVbo;
+		m_glScalarVbo = scalarVbo;
+	}
+
+	const size_t posBytes = 3 * m_s.n * sizeof(real);
+	const size_t scalarBytes = m_s.n * sizeof(real);
+
+	if (m_glDevice != m_solverDevice)
+	{
+		// Pack on the solver GPU, then peer-copy into the mapped VBOs on the GL
+		// GPU. No host involvement.
+		launchPackRender(m_s, reinterpret_cast<real3*>(m_glStagePos), m_glStageScalar, nullptr);
+		cudaCheck(cudaStreamSynchronize(nullptr), "gl pack sync");
+
+		cudaSetDevice(m_glDevice);
+		cudaGraphicsResource_t res[2] = {m_glPosRes, m_glScalarRes};
+		bool ok = cudaGraphicsMapResources(2, res, nullptr) == cudaSuccess;
+		if (ok)
+		{
+			void *pPos = nullptr, *pScalar = nullptr;
+			size_t szPos = 0, szScalar = 0;
+			ok = cudaGraphicsResourceGetMappedPointer(&pPos, &szPos, m_glPosRes) == cudaSuccess
+				&& cudaGraphicsResourceGetMappedPointer(&pScalar, &szScalar, m_glScalarRes) == cudaSuccess
+				&& szPos >= posBytes && szScalar >= scalarBytes;
+			if (ok)
+			{
+				ok = cudaMemcpyPeer(pPos, m_glDevice, m_glStagePos, m_solverDevice, posBytes) == cudaSuccess
+					&& cudaMemcpyPeer(pScalar, m_glDevice, m_glStageScalar, m_solverDevice, scalarBytes) == cudaSuccess;
+			}
+			cudaGraphicsUnmapResources(2, res, nullptr);
+		}
+		cudaSetDevice(m_solverDevice);
+		return ok;
+	}
+
+	cudaGraphicsResource_t res[2] = {m_glPosRes, m_glScalarRes};
+	if (cudaGraphicsMapResources(2, res, nullptr) != cudaSuccess)
+		return false;
+	void *pPos = nullptr, *pScalar = nullptr;
+	size_t szPos = 0, szScalar = 0;
+	bool ok = cudaGraphicsResourceGetMappedPointer(&pPos, &szPos, m_glPosRes) == cudaSuccess
+		&& cudaGraphicsResourceGetMappedPointer(&pScalar, &szScalar, m_glScalarRes) == cudaSuccess
+		&& szPos >= posBytes && szScalar >= scalarBytes;
+	if (ok)
+		launchPackRender(m_s, static_cast<real3*>(pPos), static_cast<real*>(pScalar), nullptr);
+	// Unmap is stream-ordered: GL commands issued afterwards see the data.
+	cudaGraphicsUnmapResources(2, res, nullptr);
+	return ok;
+}
+
 void DFSPHCudaBackendImpl::getBoundaryReactions(BoundaryReaction *out) const
 {
 	if (!out) return;
@@ -850,6 +966,13 @@ void DFSPHCudaBackendImpl::destroy()
 	if (m_hReduce) cudaFreeHost(m_hReduce);
 	cudaFree(m_reaction.force); cudaFree(m_reaction.torque);
 	cudaFree(m_dMaps); m_dMaps = nullptr;
+	if (m_glPosRes) { cudaGraphicsUnregisterResource(m_glPosRes); m_glPosRes = nullptr; }
+	if (m_glScalarRes) { cudaGraphicsUnregisterResource(m_glScalarRes); m_glScalarRes = nullptr; }
+	cudaFree(m_glStagePos); m_glStagePos = nullptr;
+	cudaFree(m_glStageScalar); m_glStageScalar = nullptr;
+	m_glPosVbo = m_glScalarVbo = 0;
+	m_glDevice = -1;
+	m_glFailed = false;
 	if (m_hReaction) cudaFreeHost(m_hReaction);
 	for (auto &m : m_maps) freeBoundaryMap(m);
 	m_maps.clear();

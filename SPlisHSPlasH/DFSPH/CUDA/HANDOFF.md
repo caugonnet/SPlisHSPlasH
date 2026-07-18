@@ -21,6 +21,7 @@ Do **not** edit the plan file. Todo IDs below match the plan.
 | `whole-step-graph` (milestone 9) | **done for fixed dt (2026-07-18)** | `StfGraph` + `cflMethod=0`: the entire timestep (neighborhood, both conditional while loops, forces, integration) is recorded ONCE into a `launchable_graph` (`pop_prologue_shared`) and relaunched every step — 1 graph launch + 2 host syncs per step. Bit-identical to Direct stream. Fastest orchestrator at small/medium N. Adaptive CFL falls back to the StfStream path (the CFL readback splits the step). |
 | `async-visualization` | **mostly done (2026-07-18)** | Host mirror reduced from ~4 ms to <1 ms at 85k: lean mirror (pos/vel/density only; `cudaFullMirror` param restores the debug fields), pinned staging via new backend `allocHostPinned`, async D2H + one sync, and the scatter loop capped at 8 OpenMP threads (36-thread default cost ~2.8 ms in wake-up/contention with driver threads). Triple-buffered GUI snapshots still open. |
 | `motor-coupling` | **done (validated 2026-07-18)** | Multi-boundary maps (device-resident array, per-map boundaryVolume/Xj slots `[map*capacity+i]`), per-step transform upload (H2D memcpy — no graph rebuild), per-body reaction accumulators, facade applies net force + torque-couple to dynamic bodies via `BoundaryModel::addForce` before the PBD step. MotorScene (tank + motor-driven paddle): bit-identical to CPU until first fluid–boundary contact, KE match within 0.6% under chaotic stirring; all orchestrators bit-identical to each other. 89k-particle motor scene: ~4.2 ms/step steady-state vs 44.7 ms CPU (~10.6×). |
+| `gl-interop` | **implemented 2026-07-18; verify on single-GPU-display box** | Direct CUDA→GL rendering: the GUI allocates two VBOs, `TimeStepDFSPHCUDA::fillGlRenderBuffers` packs positions + \|v\| straight into them (`kPackRender`), `Simulator_OpenGL::renderFluidVbo` draws — zero host copies on the render path. Cross-GPU case handled with a peer-copy (`cudaMemcpyPeer`) when the GL context lives on another visible CUDA device. Graceful fallback to host rendering otherwise (one-time log line). NOT yet exercised end-to-end on this workstation: the display is on the Quadro P620 and `CUDA_VISIBLE_DEVICES=0` hides it → fallback path taken. To see the direct path, drive the display from the 3080 Ti. |
 | `validate-benchmark` | pending | No parity/benchmark suite yet. |
 
 ### What is verified vs. not
@@ -363,6 +364,13 @@ record-once/relaunch-many is the right pattern.
    `updateBoundaryMapTransform` are already in place.
 
 ## Known limitations / gotchas
+- **CCCL/CUDASTF bug found (report upstream)**: `graph_ctx`'s
+  `add_mem_alloc_node` builds `cudaMemAccessDesc` entries for ALL visible CUDA
+  devices. On a machine with a non-P2P-capable pair visible (here RTX 3080 Ti +
+  Quadro P620, `CUDA_VISIBLE_DEVICES=0,1`), every graph-context allocation
+  aborts with `cudaErrorPeerAccessUnsupported` — even the feature probes. The
+  allocator should filter by `cudaDeviceCanAccessPeer`. Workaround: keep
+  `CUDA_VISIBLE_DEVICES=0`.
 - Single fluid model only; multiple fluids fall back to CPU.
 - ~~Only boundary index 0~~ Multi-boundary supported since 2026-07-18: kernels
   loop over a device-resident `s.maps[numMaps]` array with per-map

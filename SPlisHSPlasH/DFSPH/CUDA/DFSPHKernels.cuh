@@ -87,6 +87,8 @@ void launchSolverLoopCond(const real *errSum, unsigned int *iter, real *avgOut, 
 // dtUsed at the start of a relaunch; update applies CFL method 1 (or copies
 // dt2[0] when disabled).
 void launchCflRotateDt(real *dt2, cudaStream_t stream);
+// Pack positions + |velocity| into mapped GL buffers (CUDA/GL interop).
+void launchPackRender(const DeviceState &s, real3 *outPos, real *outScalar, cudaStream_t stream);
 void launchCflUpdateDt(const real *maxVelSq, real *dt2, real cflFactor, real diameter,
 					   real cflMin, real cflMax, int enabled, cudaStream_t stream);
 

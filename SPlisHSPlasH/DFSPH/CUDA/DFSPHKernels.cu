@@ -681,6 +681,22 @@ __global__ void kCflUpdateDt(const real *maxVelSq, real *dt2, real cflFactor, re
 	dt2[1] = h;
 }
 
+// Pack render data straight into mapped OpenGL buffers: positions (3 floats,
+// tight) and a color scalar (velocity magnitude, matching the GUI's default
+// "velocity" color field).
+__global__ void kPackRender(DeviceState s, real3 *outPos, real *outScalar)
+{
+	unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= s.n) return;
+	outPos[i] = s.pos[i];
+	outScalar[i] = sqrt(sqnorm(s.vel[i]));
+}
+
+void launchPackRender(const DeviceState &s, real3 *outPos, real *outScalar, cudaStream_t stream)
+{
+	kPackRender<<<gridBlocks(s.n), kBlock, 0, stream>>>(s, outPos, outScalar);
+}
+
 void launchCflRotateDt(real *dt2, cudaStream_t stream)
 {
 	kCflRotateDt<<<1, 1, 0, stream>>>(dt2);
