@@ -1,0 +1,230 @@
+{
+ "Configuration": {
+  "particleRadius": 0.012,
+  "numberOfStepsPerRenderUpdate": 4,
+  "simulationMethod": 7,
+  "gravitation": [
+   0,
+   -9.81,
+   0
+  ],
+  "cflMethod": 1,
+  "cflFactor": 1,
+  "cflMaxTimeStepSize": 0.005,
+  "boundaryHandlingMethod": 2,
+  "enableZSort": false,
+  "DFSPH": {
+   "minIterations": 2,
+   "maxIterations": 100,
+   "maxError": 0.05,
+   "maxIterationsV": 100,
+   "maxErrorV": 0.1,
+   "enableDivergenceSolver": true,
+   "cudaOrchestrator": 2
+  },
+  "stopAt": 2.0,
+  "enableVTKExport": true,
+  "dataExportFPS": 10,
+  "particleAttributes": "velocity"
+ },
+ "Materials": [
+  {
+   "id": "Fluid",
+   "density0": 1000,
+   "colorMapType": 1,
+   "viscosityMethod": 1,
+   "Standard viscosity": {
+    "viscosity": 0.01
+   }
+  }
+ ],
+ "RigidBodies": [
+  {
+   "id": 0,
+   "geometryFile": "../models/UnitCylinder.obj",
+   "translation": [
+    0,
+    0.85,
+    0
+   ],
+   "rotationAxis": [
+    1,
+    0,
+    0
+   ],
+   "rotationAngle": 1.5707963267948966,
+   "scale": [
+    1.6,
+    0.9,
+    1.6
+   ],
+   "color": [
+    0.1,
+    0.4,
+    0.6,
+    1.0
+   ],
+   "isDynamic": false,
+   "isWall": true,
+   "mapInvert": true,
+   "mapThickness": 0.0,
+   "mapResolution": [
+    30,
+    25,
+    30
+   ]
+  },
+  {
+   "id": 1,
+   "geometryFile": "../models/UnitBox.obj",
+   "translation": [
+    0,
+    0.85,
+    0
+   ],
+   "rotationAxis": [
+    1,
+    0,
+    0
+   ],
+   "rotationAngle": 0,
+   "scale": [
+    1.4,
+    0.1,
+    0.6
+   ],
+   "color": [
+    0.8,
+    0.3,
+    0.2,
+    1.0
+   ],
+   "density": 8000,
+   "isDynamic": true,
+   "isWall": false,
+   "mapInvert": false,
+   "mapThickness": 0.0,
+   "mapResolution": [
+    30,
+    8,
+    15
+   ]
+  },
+  {
+   "id": 2,
+   "geometryFile": "../models/UnitBox.obj",
+   "translation": [
+    0,
+    0.85,
+    0
+   ],
+   "rotationAxis": [
+    1,
+    0,
+    0
+   ],
+   "rotationAngle": 0,
+   "scale": [
+    0.1,
+    1.4,
+    0.6
+   ],
+   "color": [
+    0.8,
+    0.3,
+    0.2,
+    1.0
+   ],
+   "density": 8000,
+   "isDynamic": true,
+   "isWall": false,
+   "mapInvert": false,
+   "mapThickness": 0.0,
+   "mapResolution": [
+    8,
+    30,
+    15
+   ]
+  }
+ ],
+ "TargetVelocityMotorHingeJoints": [
+  {
+   "bodyID1": 1,
+   "bodyID2": 0,
+   "position": [
+    0,
+    0.85,
+    0
+   ],
+   "axis": [
+    0,
+    0,
+    1
+   ],
+   "target": -6
+  },
+  {
+   "bodyID1": 2,
+   "bodyID2": 0,
+   "position": [
+    0,
+    0.85,
+    0
+   ],
+   "axis": [
+    0,
+    0,
+    1
+   ],
+   "target": -6
+  }
+ ],
+ "FluidBlocks": [
+  {
+   "denseMode": 0,
+   "start": [
+    -0.5,
+    -0.5,
+    -0.5
+   ],
+   "end": [
+    0.5,
+    0.5,
+    0.5
+   ],
+   "translation": [
+    -0.3,
+    0.47,
+    0
+   ],
+   "scale": [
+    0.4,
+    0.3,
+    0.7
+   ]
+  },
+  {
+   "denseMode": 0,
+   "start": [
+    -0.5,
+    -0.5,
+    -0.5
+   ],
+   "end": [
+    0.5,
+    0.5,
+    0.5
+   ],
+   "translation": [
+    0.3,
+    0.47,
+    0
+   ],
+   "scale": [
+    0.4,
+    0.3,
+    0.7
+   ]
+  }
+ ]
+}

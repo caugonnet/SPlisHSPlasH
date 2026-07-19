@@ -8,6 +8,9 @@
 #include "GUI/OpenGL/Selection.h"
 #include "Utilities/FileSystem.h"
 #include "Simulator/SceneConfiguration.h"
+#ifdef USE_CUDA_DFSPH
+#include "SPlisHSPlasH/DFSPH/CUDA/TimeStepDFSPHCUDA.h"
+#endif
 #include "LogWindow.h"
 
 #include "imgui.h"
@@ -645,8 +648,42 @@ void Simulator_GUI_imgui::render()
 		bool useScalarField = true;
 		if ((field == nullptr) || (base->getScalarField(i).size() == 0))
 			useScalarField = false;
-		Simulator_OpenGL::renderFluid(model, fluidColor, base->getColorMapType(i),
-			useScalarField, base->getScalarField(i), base->getRenderMinValue(i), base->getRenderMaxValue(i));
+		bool renderedFromDevice = false;
+#ifdef USE_CUDA_DFSPH
+		// Direct GPU rendering (CUDA/GL interop): the DFSPH_CUDA backend packs
+		// positions + |velocity| straight into VBOs; no host round trip. Only for
+		// the default "velocity" color field - anything else falls back to the
+		// host path below.
+		TimeStepDFSPHCUDA *cudaTimeStep = dynamic_cast<TimeStepDFSPHCUDA*>(sim->getTimeStep());
+		if (cudaTimeStep != nullptr && base->getColorField(i) == "velocity")
+		{
+			static GLuint s_cudaPosVbo = 0, s_cudaScalarVbo = 0;
+			static unsigned int s_cudaVboCapacity = 0;
+			const unsigned int capacity = model->numParticles();
+			if (capacity > s_cudaVboCapacity)
+			{
+				// Allocate once at full capacity; the backend registers the buffers
+				// and re-registration on id change handles re-creation.
+				if (s_cudaPosVbo == 0) glGenBuffers(1, &s_cudaPosVbo);
+				if (s_cudaScalarVbo == 0) glGenBuffers(1, &s_cudaScalarVbo);
+				glBindBuffer(GL_ARRAY_BUFFER, s_cudaPosVbo);
+				glBufferData(GL_ARRAY_BUFFER, capacity * 3 * sizeof(float), nullptr, GL_DYNAMIC_DRAW);
+				glBindBuffer(GL_ARRAY_BUFFER, s_cudaScalarVbo);
+				glBufferData(GL_ARRAY_BUFFER, capacity * sizeof(float), nullptr, GL_DYNAMIC_DRAW);
+				glBindBuffer(GL_ARRAY_BUFFER, 0);
+				s_cudaVboCapacity = capacity;
+			}
+			if (cudaTimeStep->fillGlRenderBuffers(s_cudaPosVbo, s_cudaScalarVbo))
+			{
+				Simulator_OpenGL::renderFluidVbo(model, fluidColor, base->getColorMapType(i),
+					s_cudaPosVbo, s_cudaScalarVbo, base->getRenderMinValue(i), base->getRenderMaxValue(i));
+				renderedFromDevice = true;
+			}
+		}
+#endif
+		if (!renderedFromDevice)
+			Simulator_OpenGL::renderFluid(model, fluidColor, base->getColorMapType(i),
+				useScalarField, base->getScalarField(i), base->getRenderMinValue(i), base->getRenderMaxValue(i));
 		Simulator_OpenGL::renderSelectedParticles(model, getSelectedParticles(), base->getColorMapType(i),
 			base->getRenderMinValue(i), base->getRenderMaxValue(i));
 	}

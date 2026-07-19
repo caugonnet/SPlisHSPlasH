@@ -222,6 +222,53 @@ void Simulator_OpenGL::renderFluid(FluidModel *model, float *fluidColor,
 		pointShaderEnd(shader_scalar, true);
 }
 
+void Simulator_OpenGL::renderFluidVbo(FluidModel *model, float *fluidColor,
+	const unsigned int colorMapType, const unsigned int posVbo, const unsigned int scalarVbo,
+	const Real renderMinValue, const Real renderMaxValue)
+{
+	// Same shader setup as renderFluid, but vertex/scalar data live in VBOs
+	// already filled on the GPU (CUDA/GL interop) - no host upload.
+	Simulation *sim = Simulation::getCurrent();
+	const unsigned int nParticles = model->numActiveParticles();
+	if (nParticles == 0)
+		return;
+
+	const Real particleRadius = sim->getParticleRadius();
+
+	Shader *shader_scalar = &m_shader_scalar_map;
+	float const *color_map = nullptr;
+	if (colorMapType == 1)
+		color_map = reinterpret_cast<float const*>(colormap_jet);
+	else if (colorMapType == 2)
+		color_map = reinterpret_cast<float const*>(colormap_plasma);
+	else if (colorMapType == 3)
+		color_map = reinterpret_cast<float const*>(colormap_coolwarm);
+	else if (colorMapType == 4)
+		color_map = reinterpret_cast<float const*>(colormap_bwr);
+	else if (colorMapType == 5)
+		color_map = reinterpret_cast<float const*>(colormap_seismic);
+
+	if (colorMapType == 0)
+		shader_scalar = &m_shader_scalar;
+
+	pointShaderBegin(shader_scalar, particleRadius, &fluidColor[0], renderMinValue, renderMaxValue, true, color_map);
+
+	glBindBuffer(GL_ARRAY_BUFFER, posVbo);
+	glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, (void*)0);
+	glEnableVertexAttribArray(0);
+
+	glBindBuffer(GL_ARRAY_BUFFER, scalarVbo);
+	glVertexAttribPointer(1, 1, GL_FLOAT, GL_FALSE, 0, (void*)0);
+	glEnableVertexAttribArray(1);
+
+	glDrawArrays(GL_POINTS, 0, nParticles);
+	glDisableVertexAttribArray(0);
+	glDisableVertexAttribArray(1);
+	glBindBuffer(GL_ARRAY_BUFFER, 0);
+
+	pointShaderEnd(shader_scalar, true);
+}
+
 void Simulator_OpenGL::renderSelectedParticles(FluidModel *model, const std::vector<std::vector<unsigned int>>& selectedParticles,
 		const unsigned int colorMapType, 
 		const Real renderMinValue, const Real renderMaxValue)
